@@ -1,6 +1,5 @@
-// index.mjs — Asistente de voz: Twilio (WS), Deepgram (STT), Azure TTS, n8n/Supabase
-// Requisito Twilio (TwiML):
-//   <Connect><Stream track="both_tracks" url="wss://TU_HOST/twilio" /></Connect>
+// index.mjs - Asistente voice con Deepgram+Twilio+AzureTTS
+// memoria/menu/promos vía n8n+Supabase
 
 import express from 'express';
 import { WebSocketServer } from 'ws';
@@ -45,30 +44,20 @@ const AZURE_TTS_VOICE     = envStr('AZURE_TTS_VOICE', 'es-MX-DaliaNeural');
 
 // n8n integration
 const N8N_BASE_URL       = envStr('N8N_BASE_URL', '');
-const N8N_SHARED_SECRET  = envStr('N8N_SHARED_SECRET', ''); // <— obligado en prod
-const N8N_WEBHOOK_URL    = envStr('N8N_WEBHOOK_URL', '');   // opcional (solo logs)
+const N8N_SHARED_SECRET  = envStr('N8N_SHARED_SECRET', 'pizzeriadonnapoliSUPERSECRETO');
+const N8N_WEBHOOK_URL    = envStr('N8N_WEBHOOK_URL', ''); // opcional
 
-/* =========================
-   STARTUP CHECKS
-   ========================= */
-if (!process.env.OPENAI_API_KEY) {
-  console.warn('⚠️ Falta OPENAI_API_KEY (se aplicará respuesta fallback local).');
-}
-if (!AZURE_SPEECH_KEY || !AZURE_SPEECH_REGION) {
-  console.warn('⚠️ Falta Azure Speech config (AZURE_SPEECH_KEY / AZURE_SPEECH_REGION).');
-}
-if (!N8N_BASE_URL) {
-  console.warn('⚠️ N8N_BASE_URL vacío; no se cargarán menú/memoria automáticamente.');
-}
-if (!N8N_SHARED_SECRET) {
-  console.warn('⚠️ N8N_SHARED_SECRET ausente; agrega seguridad antes de producción.');
-}
 
 /* =========================
    HELPERS n8n <-> Node
    ========================= */
+
 async function callN8n(payloadObj) {
-  if (!N8N_BASE_URL) return null;
+  if (!N8N_BASE_URL) {
+    console.warn('⚠️ N8N_BASE_URL vacío, no se puede llamar a n8n');
+    return null;
+  }
+
   try {
     const res = await fetch(N8N_BASE_URL, {
       method: 'POST',
@@ -80,11 +69,17 @@ async function callN8n(payloadObj) {
     });
 
     const text = await res.text();
+
     if (!res.ok) {
       console.error('❌ n8n respondió error', res.status, text);
       return null;
     }
-    try { return JSON.parse(text); } catch { return text; }
+
+    try {
+      return JSON.parse(text);
+    } catch {
+      return text;
+    }
   } catch (e) {
     console.error('⚠️ callN8n error:', e?.message || e);
     return null;
@@ -92,10 +87,16 @@ async function callN8n(payloadObj) {
 }
 
 async function fetchClientMemory(callerId) {
-  const out = await callN8n({ action: 'get_memory', callerId });
+  const out = await callN8n({
+    action: 'get_memory',
+    callerId,
+  });
+
   if (!out || typeof out !== 'object') return {};
+
   const row = Array.isArray(out) ? out[0] : out;
   if (!row) return {};
+
   return {
     nombreCliente: row.nombre_cliente ?? null,
     direccionFavorita: row.direccion_favorita ?? null,
@@ -105,10 +106,17 @@ async function fetchClientMemory(callerId) {
 }
 
 async function fetchMenuAndPromos() {
-  const out = await callN8n({ action: 'get_menu' });
-  if (!out || typeof out !== 'object') return { menu: [], promos: [] };
+  const out = await callN8n({
+    action: 'get_menu',
+  });
+
+  if (!out || typeof out !== 'object') {
+    return { menu: [], promos: [] };
+  }
+
   console.log('🍕 Menú recibido desde n8n:', out.menu);
   console.log('🎁 Promos recibidas desde n8n:', out.promos);
+
   return {
     menu: Array.isArray(out.menu) ? out.menu : [],
     promos: Array.isArray(out.promos) ? out.promos : [],
@@ -116,7 +124,10 @@ async function fetchMenuAndPromos() {
 }
 
 async function pushClientMemoryUpdate(snapshot) {
-  const payload = { action: 'update_memory', ...snapshot };
+  const payload = {
+    action: 'update_memory',
+    ...snapshot,
+  };
   await callN8n(payload);
 }
 
@@ -134,6 +145,7 @@ async function logToN8n(payload) {
   } catch {}
 }
 
+
 /* =========================
    WS infra
    ========================= */
@@ -143,11 +155,12 @@ const streams = new Map(); // sid -> twilioSocket
 const memory  = new Map(); // sid -> state obj
 
 const SILENCE_FRAME = Buffer.alloc(160, 0xff); // 20ms mulaw @8khz
-const RMS_BARGE_THRESHOLD = 0.035;            // más sensible
-const BARGE_STREAK_FRAMES = 2;
+const RMS_BARGE_THRESHOLD = 0.05;
+const BARGE_STREAK_FRAMES = 3;
 
-// 🔐 el SID "activo" al que realmente escuchamos/respondemos
+// 🔐 el SID "activo" al que realmente escuchamos/respondernos
 let activePrimarySid = null;
+
 
 /* =========================
    STATE MGMT
@@ -194,8 +207,9 @@ function ensureState(sid) {
 
 function normalizeSid(v) {
   if (v == null) return '';
-  return String(v).trim();
+  return String(v).replace(/^=\s*/, '').trim();
 }
+
 
 /* =========================
    AUDIO UTILS
@@ -219,6 +233,7 @@ function ulawRms(buf) {
   }
   return Math.sqrt(acc / buf.length) / 32768;
 }
+
 
 /* =========================
    TTS pacing & control
@@ -324,6 +339,7 @@ function createMulawSender(
   return { push, stop };
 }
 
+
 /* =========================
    LLM (OpenAI) helpers
    ========================= */
@@ -344,6 +360,7 @@ function isNoiseUtterance(str) {
     if (common.includes(tokens.join(' '))) return true;
   }
 
+  // repeticiones tipo "aló aló aló"
   const uniq = new Set(tokens);
   if (uniq.size === 1 && tokens.length <= 5) return true;
 
@@ -378,7 +395,7 @@ Reglas de voz:
 6. Si ya tienes una dirección guardada y confirmada, no la vuelvas a pedir.
 7. Si el cliente ya está cerrando ("ya eso nomás gracias"), ofrécele despedida amable y termina.
 8. Mantén todo en español latino neutro.
-9. No hables en pesos, habla en dólares cuando se trate de precios y vocaliza mejor.
+9. No hables en pesos habla en dolares cuando se trate de precios y vocaliza mejor.
 Devuelve SOLO el texto que dirías al cliente por teléfono. Nada técnico, nada de instrucciones internas.
 `.trim();
 }
@@ -388,16 +405,9 @@ async function answerWithOpenAI(st, userText) {
     const yaSalude = (st.session.step !== 'saludo');
     const canned = yaSalude
       ? 'Sí, te escucho claro. ¿Qué te gustaría pedir?'
-      : 'Pizzería Don Napoli, hola. ¿Qué te gustaría pedir hoy?';
+      : 'Pizzería Don Napoli, hola ¿Qué te gustaría pedir hoy?';
     st.lastReplyText = canned;
     return canned;
-  }
-
-  // short-circuit si no hay API key
-  if (!envStr('OPENAI_API_KEY','')) {
-    const fallback = 'Claro, dime qué necesitas y te ayudo.';
-    st.lastReplyText = fallback;
-    return fallback;
   }
 
   const recentHistory = st.history.slice(-10);
@@ -438,12 +448,13 @@ async function answerWithOpenAI(st, userText) {
   return reply;
 }
 
+
 /* =========================
    Azure TTS
    ========================= */
 function buildSSMLFromText(text) {
-  const style  = envStr('AZURE_TTS_STYLE', 'customerservice'); // prueba 'general' si tu voz no soporta style
-  const rate   = envStr('AZURE_TTS_RATE', '+20%');            // formato válido para Azure
+  const style  = envStr('AZURE_TTS_STYLE', 'customerservice');
+  const rate   = envStr('AZURE_TTS_RATE', '1.3');
   const pitch  = envStr('AZURE_TTS_PITCH', '+2%');
   const volume = envStr('AZURE_TTS_VOLUME', 'default');
   const pause  = envNum('AZURE_TTS_PAUSE_MS', 250);
@@ -509,11 +520,11 @@ async function speakWithAzureTTS(ws, sid, text) {
     }
 
     const st = ensureState(sid);
+
     if (!st.ttsSender) {
       st.ttsSender = createMulawSender(ws, sid, 160, 20, 160 * 10);
     }
 
-    // Limpia cola de audio en Twilio antes de hablar
     sendClear(ws, sid);
 
     const buf = Buffer.from(await tts.arrayBuffer());
@@ -533,6 +544,7 @@ async function speakWithAzureTTS(ws, sid, text) {
     console.error('❌ speakWithAzureTTS exception', err);
   }
 }
+
 
 /* =========================
    TURN LOGIC
@@ -599,6 +611,7 @@ async function handleCompleteUserTurn(twilioSocket, sid) {
   }
 }
 
+
 /* =========================
    HEARTBEAT Deepgram
    ========================= */
@@ -621,6 +634,7 @@ function startDeepgramHeartbeat(dgSocket) {
   return () => { alive = false; };
 }
 
+
 /* =========================
    Twilio WS handler
    ========================= */
@@ -642,6 +656,7 @@ wss.on('connection', async (twilioSocket, req) => {
         return;
       }
 
+      // 👇 NUEVA POLÍTICA:
       // el SID más reciente SIEMPRE es el primary
       activePrimarySid = sid;
       console.log('🌟 Este SID es ahora el primary:', sid);
@@ -658,8 +673,10 @@ wss.on('connection', async (twilioSocket, req) => {
         msg.start?.callSid ||
         'desconocido';
 
-      // si ya había un dgSocket, reusarlo (swap de SID)
+      // si ya había un dgSocket en el estado (de un SID anterior) reutilízalo,
+      // porque Deepgram ya está escuchando la llamada real.
       if (!st.dgSocket) {
+        // no tenemos deepgram en este SID todavía, así que lo creamos nuevo
         const dgSocket = await deepgram.listen.live({
           model: 'nova-3',
           language: 'es',
@@ -680,29 +697,11 @@ wss.on('connection', async (twilioSocket, req) => {
           const stopHb = startDeepgramHeartbeat(dgSocket);
           st.stopHeartbeat = stopHb;
 
-          // PRE-CARGA de memoria y menú/promos ANTES del saludo
-          try {
-            const [memData, menuData] = await Promise.all([
-              fetchClientMemory(st.session.callerId),
-              fetchMenuAndPromos(),
-            ]);
-
-            if (memData && typeof memData === 'object') {
-              if (memData.nombreCliente)       st.session.nombreCliente       = memData.nombreCliente;
-              if (memData.direccionFavorita)   st.session.direccionFavorita   = memData.direccionFavorita;
-              if (memData.direccionConfirmada) st.session.direccionConfirmada = !!memData.direccionConfirmada;
-            }
-            st.session.menu   = menuData?.menu   || [];
-            st.session.promos = menuData?.promos || [];
-          } catch (err) {
-            console.error('⚠️ Error precargando memoria/menú:', err?.message || err);
-          }
-
-          // SALUDO inicial (solo una vez por sesión lógica)
+          // SALUDO inicial solo si no hemos saludado antes EN ESTA SESIÓN LÓGICA
           if (!st.hasGreeted) {
             const saludoInicial = st.session.nombreCliente
-              ? `Hola ${st.session.nombreCliente}, bienvenido/a a Pizzería Don Napoli. ¿Qué te gustaría pedir hoy?`
-              : 'Hola, somos Pizzería Don Napoli. ¿Qué te gustaría pedir hoy?';
+              ? `Hola ${st.session.nombreCliente}, bienvenido otra vez a Pizzería Don Napoli. ¿Qué deseas pedir hoy?`
+              : 'Hola, somos la pizzeria don napoli. ¿Qué te gustaría pedir hoy?';
 
             logToN8n({
               streamSid: sid,
@@ -724,6 +723,28 @@ wss.on('connection', async (twilioSocket, req) => {
             stopTTS(twilioSocket, sid, 'before_greeting');
             await speakWithAzureTTS(twilioSocket, sid, saludoInicial);
           }
+
+          // precargar memoria y menú/promos (solo 1 vez realmente útil)
+          (async () => {
+            const [memData, menuData] = await Promise.all([
+              fetchClientMemory(st.session.callerId),
+              fetchMenuAndPromos(),
+            ]);
+
+            if (memData && typeof memData === 'object') {
+              if (memData.nombreCliente)        st.session.nombreCliente        = memData.nombreCliente;
+              if (memData.direccionFavorita)    st.session.direccionFavorita    = memData.direccionFavorita;
+              if (memData.direccionConfirmada)  st.session.direccionConfirmada  = !!memData.direccionConfirmada;
+            }
+
+            st.session.menu   = menuData?.menu   || [];
+            st.session.promos = menuData?.promos || [];
+
+            console.log('🍕 Menú recibido desde n8n:', st.session.menu);
+            console.log('🎁 Promos recibidas desde n8n:', st.session.promos);
+          })().catch(err => {
+            console.error('⚠️ Error precargando memoria/menú async:', err?.message || err);
+          });
         });
 
         dgSocket.on(LiveTranscriptionEvents.Transcript, async (data) => {
@@ -737,7 +758,6 @@ wss.on('connection', async (twilioSocket, req) => {
           const isFinal = data?.is_final || data?.speech_final;
           const normalized = rawTxt.replace(/\s+/g, ' ').trim();
 
-          const st = ensureState(sid);
           st.partialBuffer = normalized;
 
           console.log(isFinal ? '🗣️ Cliente (final):' : '🗣️ Cliente (parcial):', normalized);
@@ -750,20 +770,12 @@ wss.on('connection', async (twilioSocket, req) => {
             ts: new Date().toISOString()
           });
 
-          // Debounce por silencio para forzar turn-taking cuando no llega "final"
           if (isFinal) {
             if (st.silenceTimer) {
               clearTimeout(st.silenceTimer);
               st.silenceTimer = null;
             }
             await handleCompleteUserTurn(twilioSocket, sid);
-          } else {
-            if (st.silenceTimer) clearTimeout(st.silenceTimer);
-            st.silenceTimer = setTimeout(() => {
-              if (!st.ttsActive && st.partialBuffer) {
-                handleCompleteUserTurn(twilioSocket, sid).catch(()=>{});
-              }
-            }, 900);
           }
         });
 
@@ -775,6 +787,7 @@ wss.on('connection', async (twilioSocket, req) => {
           console.log('📴 Deepgram dijo Close (lo ignoramos hasta hangup) para', sid);
         });
       } else {
+        // ya había dgSocket (por un SID anterior), o sea venimos de un swap:
         console.log('🔁 Reusando Deepgram / estado existente para SID nuevo', sid);
       }
 
@@ -800,7 +813,7 @@ wss.on('connection', async (twilioSocket, req) => {
       const audioUlaw = Buffer.from(payload, 'base64');
       if (audioUlaw.length === 0) return;
 
-      // barge-in (VAD + RMS)
+      // barge-in
       const vadInfoOpenLike = processFrame(sid, audioUlaw); // { open, rms, ... }
       const callerTalking   = !!vadInfoOpenLike.open;
       if (st.ttsActive) {
@@ -822,10 +835,13 @@ wss.on('connection', async (twilioSocket, req) => {
         st.bargeStreak = 0;
       }
 
-      // enviar audio a Deepgram
+      // mandar audio a Deepgram
       if (st.dgSocket) {
-        try { st.dgSocket.send(audioUlaw); }
-        catch (e) { console.error('❌ Error enviando audio a Deepgram para', sid, e?.message || e); }
+        try {
+          st.dgSocket.send(audioUlaw);
+        } catch (e) {
+          console.error('❌ Error enviando audio a Deepgram para', sid, e?.message || e);
+        }
       }
 
       return;
@@ -836,7 +852,8 @@ wss.on('connection', async (twilioSocket, req) => {
       const sid = twilioSocket.streamSid;
       console.log('⏹️ Twilio envió stop para', sid);
 
-      // stop de socket viejo (no primary)
+      // si este SID YA NO es el primary actual,
+      // es un socket viejo => limpieza ligera nomás
       if (sid !== activePrimarySid) {
         console.log('⏭️ stop de socket viejo, ignoro cleanup global');
         streams.delete(sid);
@@ -845,7 +862,7 @@ wss.on('connection', async (twilioSocket, req) => {
         return;
       }
 
-      // stop del primary => cleanup real
+      // este sí es el primary actual => cleanup real y colgamos sesión
       stopTTS(twilioSocket, sid, 'stop');
 
       const st = memory.get(sid);
@@ -859,17 +876,29 @@ wss.on('connection', async (twilioSocket, req) => {
           endedAt: new Date().toISOString()
         });
 
-        if (st.silenceTimer) { clearTimeout(st.silenceTimer); st.silenceTimer = null; }
+        if (st.silenceTimer) {
+          clearTimeout(st.silenceTimer);
+          st.silenceTimer = null;
+        }
 
-        if (st.dgSocket) { try { st.dgSocket.finish(); } catch {} st.dgSocket = null; }
-        if (st.stopHeartbeat) { try { st.stopHeartbeat(); } catch {} st.stopHeartbeat = null; }
+        if (st.dgSocket) {
+          try { st.dgSocket.finish(); } catch {}
+          st.dgSocket = null;
+        }
+        if (st.stopHeartbeat) {
+          try { st.stopHeartbeat(); } catch {}
+          st.stopHeartbeat = null;
+        }
       }
 
       streams.delete(sid);
       memory.delete(sid);
       clearVadState(sid);
 
-      if (sid === activePrimarySid) activePrimarySid = null;
+      // ya no hay llamada activa
+      if (sid === activePrimarySid) {
+        activePrimarySid = null;
+      }
 
       return;
     }
@@ -879,6 +908,8 @@ wss.on('connection', async (twilioSocket, req) => {
     const sid = twilioSocket.streamSid;
     console.log('❌ Twilio cerró la conexión', sid);
 
+    // si este socket NO es el primary actual
+    // => era un socket viejo, límpialo suave y ya
     if (sid && sid !== activePrimarySid) {
       console.log('⏭️ close de socket viejo, no cierro la sesión activa');
       streams.delete(sid);
@@ -887,7 +918,7 @@ wss.on('connection', async (twilioSocket, req) => {
       return;
     }
 
-    // cleanup total del primary
+    // este sí era el primary actual => cleanup total
     stopTTS(twilioSocket, sid, 'close');
 
     const st = memory.get(sid);
@@ -901,19 +932,31 @@ wss.on('connection', async (twilioSocket, req) => {
         endedAt: new Date().toISOString()
       });
 
-      if (st.silenceTimer) { clearTimeout(st.silenceTimer); st.silenceTimer = null; }
+      if (st.silenceTimer) {
+        clearTimeout(st.silenceTimer);
+        st.silenceTimer = null;
+      }
 
-      if (st.dgSocket) { try { st.dgSocket.finish(); } catch {} st.dgSocket = null; }
-      if (st.stopHeartbeat) { try { st.stopHeartbeat(); } catch {} st.stopHeartbeat = null; }
+      if (st.dgSocket) {
+        try { st.dgSocket.finish(); } catch {}
+        st.dgSocket = null;
+      }
+      if (st.stopHeartbeat) {
+        try { st.stopHeartbeat(); } catch {}
+        st.stopHeartbeat = null;
+      }
     }
 
     streams.delete(sid);
     memory.delete(sid);
     clearVadState(sid);
 
-    if (sid === activePrimarySid) activePrimarySid = null;
+    if (sid === activePrimarySid) {
+      activePrimarySid = null;
+    }
   });
 });
+
 
 /* =========================
    KEEPALIVE WSS
@@ -926,6 +969,7 @@ setInterval(() => {
 }, PING_EVERY_MS);
 
 wss.on('error', (err) => console.error('❌ WSS error:', err));
+
 
 /* =========================
    HTTP server + upgrade WS /twilio
