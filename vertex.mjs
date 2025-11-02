@@ -48,7 +48,7 @@ const AZURE_TTS_VOICE     = envStr('AZURE_TTS_VOICE', 'es-MX-DaliaNeural');
 // n8n
 const N8N_BASE_URL      = envStr('N8N_BASE_URL', '');
 const N8N_SHARED_SECRET = envStr('N8N_SHARED_SECRET', 'pizzeriadonnapoliSUPERSECRETO');
-const N8N_WEBHOOK_URL   = envStr('N8N_WEBHOOK_URL', ''); // opcional para logs
+const N8N_WEBHOOK_URL   = envStr('N8N_WEBHOOK_URL', ''); // opcional logs
 
 /* =========================
    n8n HELPERS
@@ -115,7 +115,9 @@ async function fetchMenuAndPromos() {
 }
 
 async function pushClientMemoryUpdate(snapshot) {
-  await callN8n({ action: 'update_memory', ...snapshot });
+  // sanea antes de enviar
+  const s = sanitizeSnapshot(snapshot);
+  await callN8n({ action: 'update_memory', ...s });
 }
 
 async function fetchBotConfig() {
@@ -124,6 +126,29 @@ async function fetchBotConfig() {
   return {
     greeting: out.greeting_es || null,
     systemPrompt: out.system_prompt_es || null,
+  };
+}
+
+/* =========================
+   SANITIZERS
+   ========================= */
+const toNullIfEmpty = (v) => {
+  if (v === undefined || v === null) return null;
+  const s = String(v).trim();
+  if (!s) return null;
+  const low = s.toLowerCase();
+  if (low === 'undefined' || low === 'null' || low === 'nan') return null;
+  return s;
+};
+function sanitizeSnapshot(x = {}) {
+  return {
+    callerId: toNullIfEmpty(x.callerId),
+    nombreCliente: toNullIfEmpty(x.nombreCliente),
+    direccionFavorita: toNullIfEmpty(x.direccionFavorita),
+    ultimoPedido: toNullIfEmpty(x.ultimoPedido),
+    direccionConfirmada: !!x.direccionConfirmada,
+    ultimoMensajeAsistente: toNullIfEmpty(x.ultimoMensajeAsistente),
+    endedAt: toNullIfEmpty(x.endedAt),
   };
 }
 
@@ -171,20 +196,44 @@ function classifyIntent(text) {
   const t = (text || '').toLowerCase();
   if (/\b(menu|menú|sabores|pizzas?|precios?)\b/.test(t)) return 'ask_menu';
   if (/\bpromo(s|ciones)?|oferta(s)?|descuento(s)?\b/.test(t)) return 'ask_promos';
+  // algo como confirmar dirección / cierre
+  if (/\b(confirmo|es correcto|esa es|sí,? (confirmo|está bien))\b/.test(t)) return 'confirm_address';
+  if (/\b(gracias|solo eso|nada más|está bien|listo)\b/.test(t)) return 'closing';
   return 'chat';
 }
 
 /* =========================
-   ENTITY EXTRACTION (heurística)
+   ENTITY EXTRACTION (heurística simple)
    ========================= */
 async function extractEntities(userText) {
   const out = { nombreCliente: null, direccionFavorita: null, ultimoPedido: null };
-  const m1 = userText.match(/\b(me llamo|soy)\s+([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+)(\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+)?/i);
-  if (m1) out.nombreCliente = (m1[2] + ' ' + (m1[3] || '')).trim();
-  const m2 = userText.match(/\b(direcci[oó]n es|env[íi]a a|entrega en|a la|a mi casa en)\s+([^.,;]{8,})/i);
+  // nombre
+  const m1 = userText.match(/\b(me llamo|soy)\s+([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+)*)/i);
+  if (m1) out.nombreCliente = m1[2].trim();
+
+  // dirección (captura libre hasta punto o fin)
+  const m2 = userText.match(/\b(mi\s+direcci[oó]n\s+es|env[íi]a[rn]? a|entrega en|enviarlo a|a la|a mi casa en)\s+([^.;]{8,})/i);
   if (m2) out.direccionFavorita = m2[2].trim();
-  const m3 = userText.match(/\b(quiero|deme|pon|me das|una|un)\s+([a-záéíóúñ0-9\s\-]{4,})/i);
-  if (m3) out.ultimoPedido = m3[2].trim();
+
+  // pedido (pizza/bebida genérica)
+  const pedidoRegex = /\b(quiero|deme|pon|me das|me pones|me agregas|una|un)\s+([a-záéíóúñ0-9\s\-\.,]{4,})/i;
+  const m3 = userText.match(pedidoRegex);
+  if (m3) out.ultimoPedido = m3[2].replace(/\s{2,}/g, ' ').trim();
+
+  // afinado bebidas y pizza típica
+  if (!out.ultimoPedido) {
+    const bebida = userText.match(/\b(coca[\-\s]?cola|sprite|fanta|gaseosa|cola)\b/i);
+    const pizza = userText.match(/\b(pizza\s+(?:de\s+)?[a-záéíóúñ]+|pepperoni|margarita|hawaiana)\b/i);
+    const extra = [];
+    if (pizza) extra.push(pizza[0]);
+    if (bebida) extra.push(bebida[0]);
+    if (extra.length) out.ultimoPedido = extra.join(' y ');
+  }
+
+  // limpieza
+  out.nombreCliente = toNullIfEmpty(out.nombreCliente);
+  out.direccionFavorita = toNullIfEmpty(out.direccionFavorita);
+  out.ultimoPedido = toNullIfEmpty(out.ultimoPedido);
   return out;
 }
 
@@ -388,7 +437,7 @@ async function speakWithAzureTTS(ws, streamSid, text) {
       const slice = buf.subarray(i, Math.min(i + CHUNK, buf.length));
       st.ttsSender?.push(slice);
     }
-    // cola de silencio (~120ms) para evitar cortes
+    // colita de silencio (~120ms)
     const tail = Buffer.alloc(160 * 6, 0xff);
     st.ttsSender?.push(tail);
 
@@ -420,6 +469,7 @@ function ensureCallState(callSid) {
         step: 'saludo',
         menu: [],
         promos: [],
+        ultimoPedido: null,
       },
       history: [],
       lastReplyText: '',
@@ -475,6 +525,30 @@ function startDeepgramHeartbeat(dgSocket) {
 /* =========================
    TURN HANDLER
    ========================= */
+async function persistSnapshotFromText(st, assistantReplyText) {
+  const ents = await extractEntities(st.lastUserTurnHandled || st.partialBuffer || '');
+  // heurística: marcar dirección confirmada si el usuario lo dice
+  const text = (st.lastUserTurnHandled || '').toLowerCase();
+  const direccionConfirmada = st.session.direccionConfirmada || /\b(confirmo|es correcto|sí,? confirmo|sí confirmo)\b/.test(text);
+
+  const snapshot = {
+    callerId: st.session.callerId || st.session.callSid || null,
+    nombreCliente: ents.nombreCliente ?? st.session.nombreCliente ?? null,
+    direccionFavorita: ents.direccionFavorita ?? st.session.direccionFavorita ?? null,
+    ultimoPedido: ents.ultimoPedido ?? st.session.ultimoPedido ?? null,
+    direccionConfirmada,
+    ultimoMensajeAsistente: assistantReplyText || st.lastReplyText || null,
+  };
+
+  // aplica al estado y persiste
+  st.session.nombreCliente     = snapshot.nombreCliente;
+  st.session.direccionFavorita = snapshot.direccionFavorita;
+  st.session.ultimoPedido      = snapshot.ultimoPedido;
+  st.session.direccionConfirmada = snapshot.direccionConfirmada;
+
+  await pushClientMemoryUpdate(snapshot);
+}
+
 async function handleCompleteUserTurn(twilioSocket, streamSid, st) {
   if (st.handlingTurn) return;
   st.handlingTurn = true;
@@ -493,10 +567,10 @@ async function handleCompleteUserTurn(twilioSocket, streamSid, st) {
     logToN8n({ streamSid, type: 'user_turn_finalized', role: 'user', mensaje: humanText, ts: new Date().toISOString() });
 
     const intent = classifyIntent(humanText);
+    let reply;
 
-    // Intent dirigido a DATA
+    // Data intents primero (si pregunta menu/promos)
     if (intent === 'ask_menu' || intent === 'ask_promos') {
-      let reply;
       const data = await fetchMenuAndPromos();
       if (intent === 'ask_menu') {
         st.session.menu = data.menu || [];
@@ -507,62 +581,34 @@ async function handleCompleteUserTurn(twilioSocket, streamSid, st) {
         const act = (st.session.promos || []).filter(p => p.activa).slice(0, 2).map(p => `${p.titulo}: ${p.descripcion}`).join(' | ');
         reply = act ? `Promos activas: ${act}. ¿Te interesa alguna?` : 'Por ahora no hay promociones activas. Igual puedo recomendarte opciones ricas del menú.';
       }
-
-      st.history.push({ role: 'assistant', content: reply });
-      if (st.history.length > 30) st.history.splice(0, st.history.length - 30);
-
-      stopTTS(twilioSocket, streamSid, 'before_new_reply');
-      await speakWithAzureTTS(twilioSocket, streamSid, reply);
-
-      st.lastUserTurnHandled      = humanText;
-      st.lastUserTurnAnsweredText = humanText;
-      st.partialBuffer            = '';
-
-      // Extrae y guarda memoria
-      const ents = await extractEntities(humanText);
-      const snapshot = {
-        callerId: st.session.callerId || null,
-        nombreCliente: ents.nombreCliente ?? st.session.nombreCliente ?? null,
-        direccionFavorita: ents.direccionFavorita ?? st.session.direccionFavorita ?? null,
-        ultimoPedido: ents.ultimoPedido ?? st.session.ultimoPedido ?? null,
-        direccionConfirmada: st.session.direccionConfirmada ?? false,
-        ultimoMensajeAsistente: reply,
-      };
-      st.session.nombreCliente     = snapshot.nombreCliente;
-      st.session.direccionFavorita = snapshot.direccionFavorita;
-      st.session.ultimoPedido      = snapshot.ultimoPedido;
-      await pushClientMemoryUpdate(snapshot);
-      return;
+    } else if (intent === 'confirm_address') {
+      // Reacciona a confirmación de dirección
+      st.session.direccionConfirmada = true;
+      reply = 'Gracias por confirmar. ¿Deseas agregar algo más o finalizamos tu pedido?';
+    } else if (intent === 'closing') {
+      // Cierre amable
+      reply = 'Gracias por tu pedido. ¡Que tengas un excelente día! 😊';
+    } else {
+      // Chat general con prompt de BD
+      if (!st._config) st._config = await fetchBotConfig();
+      const sysPrompt = buildSystemPromptFromDbTemplate(st._config?.systemPrompt || '', st.session);
+      reply = await answerWithOpenAI_usingSystemPrompt(st, humanText, sysPrompt);
     }
 
-    // Chat general: usa prompt desde BD
-    if (!st._config) st._config = await fetchBotConfig();
-    const sysPrompt = buildSystemPromptFromDbTemplate(st._config?.systemPrompt || '', st.session);
-
-    const reply = await answerWithOpenAI_usingSystemPrompt(st, humanText, sysPrompt);
-    st.history.push({ role: 'assistant', content: reply });
-    if (st.history.length > 30) st.history.splice(0, st.history.length - 30);
-
+    // Envía TTS
     stopTTS(twilioSocket, streamSid, 'before_new_reply');
     await speakWithAzureTTS(twilioSocket, streamSid, reply);
 
+    // Historial y buffers
+    st.history.push({ role: 'assistant', content: reply });
+    if (st.history.length > 30) st.history.splice(0, st.history.length - 30);
     st.lastUserTurnHandled      = humanText;
     st.lastUserTurnAnsweredText = humanText;
     st.partialBuffer            = '';
+    st.lastReplyText            = reply;
 
-    const ents = await extractEntities(humanText);
-    const snapshot = {
-      callerId: st.session.callerId || null,
-      nombreCliente: ents.nombreCliente ?? st.session.nombreCliente ?? null,
-      direccionFavorita: ents.direccionFavorita ?? st.session.direccionFavorita ?? null,
-      ultimoPedido: ents.ultimoPedido ?? st.session.ultimoPedido ?? null,
-      direccionConfirmada: st.session.direccionConfirmada ?? false,
-      ultimoMensajeAsistente: reply,
-    };
-    st.session.nombreCliente     = snapshot.nombreCliente;
-    st.session.direccionFavorita = snapshot.direccionFavorita;
-    st.session.ultimoPedido      = snapshot.ultimoPedido;
-    await pushClientMemoryUpdate(snapshot);
+    // Persistir memoria con entidades detectadas y último mensaje
+    await persistSnapshotFromText(st, reply);
 
   } finally {
     st.handlingTurn = false;
