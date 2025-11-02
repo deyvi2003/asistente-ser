@@ -90,16 +90,26 @@ async function logToN8n(payload) {
   } catch {}
 }
 
+const toNullIfEmpty = (v) => {
+  if (v === undefined || v === null) return null;
+  const s = String(v).trim();
+  if (!s) return null;
+  const low = s.toLowerCase();
+  // limpia "null", "undefined", "NaN" como texto
+  if (low === 'undefined' || low === 'null' || low === 'nan') return null;
+  return s;
+};
+
 async function fetchClientMemory(callerId) {
   const out = await callN8n({ action: 'get_memory', callerId });
   if (!out || typeof out !== 'object') return {};
   const row = Array.isArray(out) ? out[0] : out;
   if (!row) return {};
   return {
-    nombreCliente: row.nombre_cliente ?? null,
-    numeroTelefono: row.numero_telefono ?? null,
+    nombreCliente: toNullIfEmpty(row.nombre_cliente),
+    numeroTelefono: toNullIfEmpty(row.numero_telefono),
     direccionConfirmada: !!row.direccion_confirmada,
-    ultimoPedido: row.ultimo_pedido ?? null,
+    ultimoPedido: toNullIfEmpty(row.ultimo_pedido),
   };
 }
 
@@ -114,6 +124,18 @@ async function fetchMenuAndPromos() {
   return { menu, promos };
 }
 
+function sanitizeSnapshot(x = {}) {
+  return {
+    callerId: toNullIfEmpty(x.callerId),
+    nombreCliente: toNullIfEmpty(x.nombreCliente),
+    numeroTelefono: toNullIfEmpty(x.numeroTelefono),
+    ultimoPedido: toNullIfEmpty(x.ultimoPedido),
+    direccionConfirmada: !!x.direccionConfirmada,
+    ultimoMensajeAsistente: toNullIfEmpty(x.ultimoMensajeAsistente),
+    endedAt: toNullIfEmpty(x.endedAt),
+  };
+}
+
 async function pushClientMemoryUpdate(snapshot) {
   // sanea antes de enviar
   const s = sanitizeSnapshot(snapshot);
@@ -126,29 +148,6 @@ async function fetchBotConfig() {
   return {
     greeting: out.greeting_es || null,
     systemPrompt: out.system_prompt_es || null,
-  };
-}
-
-/* =========================
-   SANITIZERS
-   ========================= */
-const toNullIfEmpty = (v) => {
-  if (v === undefined || v === null) return null;
-  const s = String(v).trim();
-  if (!s) return null;
-  const low = s.toLowerCase();
-  if (low === 'undefined' || low === 'null' || low === 'nan') return null;
-  return s;
-};
-function sanitizeSnapshot(x = {}) {
-  return {
-    callerId: toNullIfEmpty(x.callerId),
-    nombreCliente: toNullIfEmpty(x.nombreCliente),
-    numeroTelefono: toNullIfEmpty(x.numeroTelefono),
-    ultimoPedido: toNullIfEmpty(x.ultimoPedido),
-    direccionConfirmada: !!x.direccionConfirmada,
-    ultimoMensajeAsistente: toNullIfEmpty(x.ultimoMensajeAsistente),
-    endedAt: toNullIfEmpty(x.endedAt),
   };
 }
 
@@ -240,11 +239,19 @@ async function answerWithOpenAI_usingSystemPrompt(st, userText, systemPrompt) {
     st.lastReplyText = canned;
     return canned;
   }
+
+  const apiKey = envStr('OPENAI_API_KEY', '');
+  if (!apiKey) {
+    const fallback = 'Claro, dime qué necesitas y te ayudo.';
+    st.lastReplyText = fallback;
+    return fallback;
+  }
+
   const recentHistory = st.history.slice(-10);
   const resp = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${envStr('OPENAI_API_KEY', '')}`,
+      Authorization: `Bearer ${apiKey}`,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
@@ -261,6 +268,7 @@ async function answerWithOpenAI_usingSystemPrompt(st, userText, systemPrompt) {
       ].filter(Boolean),
     }),
   });
+
   if (!resp.ok) {
     const body = await resp.text().catch(()=> '');
     console.error('❌ OpenAI Chat error', resp.status, body);
@@ -314,7 +322,7 @@ function createMulawSender(ws, sid, frameBytes = 160, frameMs = 20, prebufferByt
       timer = setTimeout(tick, frameMs);
       return;
     }
-    if (ws.bufferedAmount > 64 * 1024) { // backpressure
+    if (ws.bufferedAmount > 64 * 1024) {
       timer = setTimeout(tick, Math.min(frameMs * 2, 50));
       return;
     }
@@ -455,7 +463,7 @@ function ensureCallState(callSid) {
         callerId: null,
         callSid,
         nombreCliente: null,
-        numeroTelefono: null,      // <- reemplaza direccionFavorita
+        numeroTelefono: null,      // ← reemplaza direccionFavorita
         direccionConfirmada: false,
         modo: 'venta',
         step: 'saludo',
@@ -634,6 +642,7 @@ wss.on('connection', async (twilioSocket, req) => {
       const st = ensureCallState(callSid);
       console.log('▶️ start streamSid:', streamSid, 'callSid:', callSid, '| streams activos:', streams.size);
 
+      // Twilio suele traer el número en msg.start.from (E.164) o caller
       st.session.callerId = msg.start?.from || msg.start?.caller || callSid || 'desconocido';
       // desde el inicio setea numeroTelefono = callerId
       st.session.numeroTelefono = st.session.callerId;
