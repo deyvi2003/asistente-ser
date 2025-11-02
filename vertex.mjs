@@ -95,6 +95,7 @@ const toNullIfEmpty = (v) => {
   const s = String(v).trim();
   if (!s) return null;
   const low = s.toLowerCase();
+  // limpia "null", "undefined", "NaN" como texto
   if (low === 'undefined' || low === 'null' || low === 'nan') return null;
   return s;
 };
@@ -459,15 +460,15 @@ function ensureCallState(callSid) {
         callerId: null,
         callSid,
         nombreCliente: null,
-        numeroTelefono: null,      // ← reemplaza direccionFavorita
+        numeroTelefono: null,      // ← se llenará con el número del cliente
         direccionConfirmada: false,
         modo: 'venta',
         step: 'saludo',
         menu: [],
         promos: [],
         ultimoPedido: null,
-        toNumber: null,            // ← **nuevo**: número del negocio (Twilio)
-        callerName: null,          // ← **nuevo**: nombre si Twilio lo provee
+        toNumber: null,
+        callerName: null,
       },
       history: [],
       lastReplyText: '',
@@ -528,6 +529,7 @@ async function persistSnapshotFromText(st, assistantReplyText) {
   const text = (st.lastUserTurnHandled || '').toLowerCase();
   const direccionConfirmada = st.session.direccionConfirmada || /\b(confirmo|es correcto|sí,? confirmo|sí confirmo)\b/.test(text);
 
+  // SIEMPRE guarda el número que llama en numeroTelefono
   const snapshot = {
     callerId: st.session.callerId || st.session.callSid || null,
     nombreCliente: ents.nombreCliente ?? st.session.nombreCliente ?? null,
@@ -537,6 +539,7 @@ async function persistSnapshotFromText(st, assistantReplyText) {
     ultimoMensajeAsistente: assistantReplyText || st.lastReplyText || null,
   };
 
+  // aplica al estado y persiste
   st.session.nombreCliente        = snapshot.nombreCliente;
   st.session.numeroTelefono       = snapshot.numeroTelefono;
   st.session.ultimoPedido         = snapshot.ultimoPedido;
@@ -565,6 +568,7 @@ async function handleCompleteUserTurn(twilioSocket, streamSid, st) {
     const intent = classifyIntent(humanText);
     let reply;
 
+    // Intenciones de datos primero (menú/promos)
     if (intent === 'ask_menu' || intent === 'ask_promos') {
       const data = await fetchMenuAndPromos();
       if (intent === 'ask_menu') {
@@ -587,9 +591,11 @@ async function handleCompleteUserTurn(twilioSocket, streamSid, st) {
       reply = await answerWithOpenAI_usingSystemPrompt(st, humanText, sysPrompt);
     }
 
+    // Envía TTS
     stopTTS(twilioSocket, streamSid, 'before_new_reply');
     await speakWithAzureTTS(twilioSocket, streamSid, reply);
 
+    // Historial y buffers
     st.history.push({ role: 'assistant', content: reply });
     if (st.history.length > 30) st.history.splice(0, st.history.length - 30);
     st.lastUserTurnHandled      = humanText;
@@ -597,11 +603,38 @@ async function handleCompleteUserTurn(twilioSocket, streamSid, st) {
     st.partialBuffer            = '';
     st.lastReplyText            = reply;
 
+    // Persistir memoria con entidades detectadas y último mensaje
     await persistSnapshotFromText(st, reply);
 
   } finally {
     st.handlingTurn = false;
   }
+}
+
+/* =========================
+   Twilio customParameters (robusto)
+   ========================= */
+function readStartParam(msg, key) {
+  const raw = msg?.start?.customParameters;
+  if (!raw) return null;
+
+  // Array tipo [{name,value}]
+  if (Array.isArray(raw)) {
+    const hit = raw.find(p => (p?.name === key) || (p?.Name === key));
+    return hit?.value ?? hit?.Value ?? null;
+  }
+  // Objeto tipo { from:"+593...", to:"...", callerName:"..." }
+  if (typeof raw === 'object') {
+    return raw[key] ?? raw[key?.toLowerCase?.()] ?? raw[key?.toUpperCase?.()] ?? null;
+  }
+  // String tipo querystring
+  if (typeof raw === 'string') {
+    try {
+      const params = new URLSearchParams(raw);
+      return params.get(key);
+    } catch {}
+  }
+  return null;
 }
 
 /* =========================
@@ -634,23 +667,21 @@ wss.on('connection', async (twilioSocket, req) => {
       const st = ensureCallState(callSid);
       console.log('▶️ start streamSid:', streamSid, 'callSid:', callSid, '| streams activos:', streams.size);
 
-      // ========= NUEVO: leer customParameters del <Stream> (from/to/callerName) =========
-      const params = msg.start?.customParameters || [];
-      const getParam = (n) => params.find(p => p?.name === n)?.value || null;
-      const fromParam = getParam('from');         // número del cliente E.164
-      const toParam   = getParam('to');           // número de tu Twilio
-      const nameParam = getParam('callerName');   // si Twilio provee nombre
+      // Lee parámetros robustamente
+      const fromParam = readStartParam(msg, 'from');        // número del cliente E.164
+      const toParam   = readStartParam(msg, 'to');          // número de tu línea Twilio
+      const nameParam = readStartParam(msg, 'callerName');  // opcional
 
-      // Twilio también puede enviar from/caller en start
+      // Fallback por si Twilio no mandó customParameters
       const fallbackFrom = msg.start?.from || msg.start?.caller || null;
 
-      // Guardar en sesión (prioriza el parámetro explícito)
-      st.session.callerId   = toNullIfEmpty(fromParam) || toNullIfEmpty(fallbackFrom) || callSid || 'desconocido';
-      st.session.numeroTelefono = st.session.callerId; // se persiste este número
-      st.session.toNumber   = toNullIfEmpty(toParam) || st.session.toNumber || null;
-      st.session.callerName = toNullIfEmpty(nameParam) || st.session.callerName || null;
+      // Guardar en sesión
+      st.session.callerId       = toNullIfEmpty(fromParam) || toNullIfEmpty(fallbackFrom) || callSid || 'desconocido';
+      st.session.numeroTelefono = st.session.callerId; // persistiremos este número
+      st.session.toNumber       = toNullIfEmpty(toParam) || st.session.toNumber || null;
+      st.session.callerName     = toNullIfEmpty(nameParam) || st.session.callerName || null;
+
       st.bargeStreak = 0;
-      // =========================================================================
 
       // Reusar DG si ya existe en la llamada; si no, crear
       if (!st.dgSocket) {
@@ -692,7 +723,7 @@ wss.on('connection', async (twilioSocket, req) => {
             } catch (e) { console.error('precarga error:', e?.message || e); }
           }
 
-          // Saludo desde BD (plantilla por establecimiento)
+          // Saludo desde BD
           if (!st.hasGreeted) {
             const greetingTpl = st._config?.greeting || 'Hola, somos Pizzería Don Napoli. ¿Qué te gustaría pedir hoy?';
             const saludo = renderTemplate(greetingTpl, {
