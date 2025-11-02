@@ -97,7 +97,7 @@ async function fetchClientMemory(callerId) {
   if (!row) return {};
   return {
     nombreCliente: row.nombre_cliente ?? null,
-    direccionFavorita: row.direccion_favorita ?? null,
+    numeroTelefono: row.numero_telefono ?? null,
     direccionConfirmada: !!row.direccion_confirmada,
     ultimoPedido: row.ultimo_pedido ?? null,
   };
@@ -144,7 +144,7 @@ function sanitizeSnapshot(x = {}) {
   return {
     callerId: toNullIfEmpty(x.callerId),
     nombreCliente: toNullIfEmpty(x.nombreCliente),
-    direccionFavorita: toNullIfEmpty(x.direccionFavorita),
+    numeroTelefono: toNullIfEmpty(x.numeroTelefono),
     ultimoPedido: toNullIfEmpty(x.ultimoPedido),
     direccionConfirmada: !!x.direccionConfirmada,
     ultimoMensajeAsistente: toNullIfEmpty(x.ultimoMensajeAsistente),
@@ -170,7 +170,7 @@ function buildSystemPromptFromDbTemplate(systemPromptTpl, session) {
   const ctx = {
     callerId: session.callerId,
     nombreCliente: session.nombreCliente,
-    direccionFavorita: session.direccionFavorita,
+    numeroTelefono: session.numeroTelefono || session.callerId,
     direccionConfirmada: session.direccionConfirmada ? 'sí' : 'no',
   };
   let prompt = renderTemplate(systemPromptTpl, ctx);
@@ -196,7 +196,6 @@ function classifyIntent(text) {
   const t = (text || '').toLowerCase();
   if (/\b(menu|menú|sabores|pizzas?|precios?)\b/.test(t)) return 'ask_menu';
   if (/\bpromo(s|ciones)?|oferta(s)?|descuento(s)?\b/.test(t)) return 'ask_promos';
-  // algo como confirmar dirección / cierre
   if (/\b(confirmo|es correcto|esa es|sí,? (confirmo|está bien))\b/.test(t)) return 'confirm_address';
   if (/\b(gracias|solo eso|nada más|está bien|listo)\b/.test(t)) return 'closing';
   return 'chat';
@@ -206,21 +205,16 @@ function classifyIntent(text) {
    ENTITY EXTRACTION (heurística simple)
    ========================= */
 async function extractEntities(userText) {
-  const out = { nombreCliente: null, direccionFavorita: null, ultimoPedido: null };
+  const out = { nombreCliente: null, ultimoPedido: null };
   // nombre
   const m1 = userText.match(/\b(me llamo|soy)\s+([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+)*)/i);
   if (m1) out.nombreCliente = m1[2].trim();
-
-  // dirección (captura libre hasta punto o fin)
-  const m2 = userText.match(/\b(mi\s+direcci[oó]n\s+es|env[íi]a[rn]? a|entrega en|enviarlo a|a la|a mi casa en)\s+([^.;]{8,})/i);
-  if (m2) out.direccionFavorita = m2[2].trim();
 
   // pedido (pizza/bebida genérica)
   const pedidoRegex = /\b(quiero|deme|pon|me das|me pones|me agregas|una|un)\s+([a-záéíóúñ0-9\s\-\.,]{4,})/i;
   const m3 = userText.match(pedidoRegex);
   if (m3) out.ultimoPedido = m3[2].replace(/\s{2,}/g, ' ').trim();
 
-  // afinado bebidas y pizza típica
   if (!out.ultimoPedido) {
     const bebida = userText.match(/\b(coca[\-\s]?cola|sprite|fanta|gaseosa|cola)\b/i);
     const pizza = userText.match(/\b(pizza\s+(?:de\s+)?[a-záéíóúñ]+|pepperoni|margarita|hawaiana)\b/i);
@@ -230,9 +224,7 @@ async function extractEntities(userText) {
     if (extra.length) out.ultimoPedido = extra.join(' y ');
   }
 
-  // limpieza
   out.nombreCliente = toNullIfEmpty(out.nombreCliente);
-  out.direccionFavorita = toNullIfEmpty(out.direccionFavorita);
   out.ultimoPedido = toNullIfEmpty(out.ultimoPedido);
   return out;
 }
@@ -463,7 +455,7 @@ function ensureCallState(callSid) {
         callerId: null,
         callSid,
         nombreCliente: null,
-        direccionFavorita: null,
+        numeroTelefono: null,      // <- reemplaza direccionFavorita
         direccionConfirmada: false,
         modo: 'venta',
         step: 'saludo',
@@ -527,24 +519,24 @@ function startDeepgramHeartbeat(dgSocket) {
    ========================= */
 async function persistSnapshotFromText(st, assistantReplyText) {
   const ents = await extractEntities(st.lastUserTurnHandled || st.partialBuffer || '');
-  // heurística: marcar dirección confirmada si el usuario lo dice
   const text = (st.lastUserTurnHandled || '').toLowerCase();
   const direccionConfirmada = st.session.direccionConfirmada || /\b(confirmo|es correcto|sí,? confirmo|sí confirmo)\b/.test(text);
 
+  // SIEMPRE guarda el número que llama en numeroTelefono
   const snapshot = {
     callerId: st.session.callerId || st.session.callSid || null,
     nombreCliente: ents.nombreCliente ?? st.session.nombreCliente ?? null,
-    direccionFavorita: ents.direccionFavorita ?? st.session.direccionFavorita ?? null,
+    numeroTelefono: st.session.callerId || st.session.numeroTelefono || null,
     ultimoPedido: ents.ultimoPedido ?? st.session.ultimoPedido ?? null,
     direccionConfirmada,
     ultimoMensajeAsistente: assistantReplyText || st.lastReplyText || null,
   };
 
   // aplica al estado y persiste
-  st.session.nombreCliente     = snapshot.nombreCliente;
-  st.session.direccionFavorita = snapshot.direccionFavorita;
-  st.session.ultimoPedido      = snapshot.ultimoPedido;
-  st.session.direccionConfirmada = snapshot.direccionConfirmada;
+  st.session.nombreCliente        = snapshot.nombreCliente;
+  st.session.numeroTelefono       = snapshot.numeroTelefono;
+  st.session.ultimoPedido         = snapshot.ultimoPedido;
+  st.session.direccionConfirmada  = snapshot.direccionConfirmada;
 
   await pushClientMemoryUpdate(snapshot);
 }
@@ -569,7 +561,7 @@ async function handleCompleteUserTurn(twilioSocket, streamSid, st) {
     const intent = classifyIntent(humanText);
     let reply;
 
-    // Data intents primero (si pregunta menu/promos)
+    // Intenciones de datos primero (menú/promos)
     if (intent === 'ask_menu' || intent === 'ask_promos') {
       const data = await fetchMenuAndPromos();
       if (intent === 'ask_menu') {
@@ -582,14 +574,11 @@ async function handleCompleteUserTurn(twilioSocket, streamSid, st) {
         reply = act ? `Promos activas: ${act}. ¿Te interesa alguna?` : 'Por ahora no hay promociones activas. Igual puedo recomendarte opciones ricas del menú.';
       }
     } else if (intent === 'confirm_address') {
-      // Reacciona a confirmación de dirección
       st.session.direccionConfirmada = true;
       reply = 'Gracias por confirmar. ¿Deseas agregar algo más o finalizamos tu pedido?';
     } else if (intent === 'closing') {
-      // Cierre amable
       reply = 'Gracias por tu pedido. ¡Que tengas un excelente día! 😊';
     } else {
-      // Chat general con prompt de BD
       if (!st._config) st._config = await fetchBotConfig();
       const sysPrompt = buildSystemPromptFromDbTemplate(st._config?.systemPrompt || '', st.session);
       reply = await answerWithOpenAI_usingSystemPrompt(st, humanText, sysPrompt);
@@ -646,6 +635,8 @@ wss.on('connection', async (twilioSocket, req) => {
       console.log('▶️ start streamSid:', streamSid, 'callSid:', callSid, '| streams activos:', streams.size);
 
       st.session.callerId = msg.start?.from || msg.start?.caller || callSid || 'desconocido';
+      // desde el inicio setea numeroTelefono = callerId
+      st.session.numeroTelefono = st.session.callerId;
       st.bargeStreak = 0;
 
       // Reusar DG si ya existe en la llamada; si no, crear
@@ -679,7 +670,7 @@ wss.on('connection', async (twilioSocket, req) => {
               ]);
               if (memData && typeof memData === 'object') {
                 if (memData.nombreCliente)        st.session.nombreCliente        = memData.nombreCliente;
-                if (memData.direccionFavorita)    st.session.direccionFavorita    = memData.direccionFavorita;
+                if (memData.numeroTelefono)       st.session.numeroTelefono       = memData.numeroTelefono;
                 if (memData.direccionConfirmada)  st.session.direccionConfirmada  = !!memData.direccionConfirmada;
                 if (memData.ultimoPedido)         st.session.ultimoPedido         = memData.ultimoPedido;
               }
@@ -694,7 +685,7 @@ wss.on('connection', async (twilioSocket, req) => {
             const saludo = renderTemplate(greetingTpl, {
               callerId: st.session.callerId,
               nombreCliente: st.session.nombreCliente,
-              direccionFavorita: st.session.direccionFavorita,
+              numeroTelefono: st.session.numeroTelefono || st.session.callerId,
               direccionConfirmada: st.session.direccionConfirmada ? 'sí' : 'no'
             });
 
@@ -799,7 +790,7 @@ wss.on('connection', async (twilioSocket, req) => {
           await pushClientMemoryUpdate({
             callerId: st.session.callerId || null,
             nombreCliente: st.session.nombreCliente || null,
-            direccionFavorita: st.session.direccionFavorita || null,
+            numeroTelefono: st.session.callerId || st.session.numeroTelefono || null,
             ultimoPedido: st.session.ultimoPedido || null,
             direccionConfirmada: !!st.session.direccionConfirmada,
             ultimoMensajeAsistente: st.lastReplyText || null,
@@ -836,7 +827,7 @@ wss.on('connection', async (twilioSocket, req) => {
       await pushClientMemoryUpdate({
         callerId: st.session.callerId || null,
         nombreCliente: st.session.nombreCliente || null,
-        direccionFavorita: st.session.direccionFavorita || null,
+        numeroTelefono: st.session.callerId || st.session.numeroTelefono || null,
         ultimoPedido: st.session.ultimoPedido || null,
         direccionConfirmada: !!st.session.direccionConfirmada,
         ultimoMensajeAsistente: st.lastReplyText || null,
