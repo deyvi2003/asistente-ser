@@ -114,7 +114,7 @@ async function fetchClientMemory(callerId) {
 }
 
 async function fetchMenuAndPromos() {
-  const out = await callN8n({ action: 'get_menu' });
+  const out = await callN8n({ action: 'get_menu'||'get_promos' });
   if (!out) return { menu: [], promos: [] };
   let menu = [], promos = [];
   try {
@@ -725,7 +725,7 @@ wss.on('connection', async (twilioSocket, req) => {
 
           // Saludo desde BD
           if (!st.hasGreeted) {
-            const greetingTpl = st._config?.greeting || 'Hola, somos Pizzería Don Napoli. ¿Qué te gustaría pedir hoy?';
+            const greetingTpl = st._config?.greeting ;
             const saludo = renderTemplate(greetingTpl, {
               callerId: st.session.callerId,
               nombreCliente: st.session.nombreCliente,
