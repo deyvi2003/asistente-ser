@@ -113,7 +113,7 @@ async function fetchClientMemory(callerId) {
   };
 }
 
-/* ===== NUEVO: helpers explícitos para menú y promos ===== */
+/* ===== Helpers explícitos para menú y promos (desde BD vía n8n) ===== */
 async function fetchMenuOnly() {
   const out = await callN8n({ action: 'get_menu' });
   const menu = Array.isArray(out?.menu) ? out.menu : (Array.isArray(out) ? out : []);
@@ -137,7 +137,7 @@ async function fetchPromosOnly() {
   }));
 }
 
-// (opcional) combinado, reusado en precarga inicial
+// (opcional) combinado para precarga
 async function fetchMenuAndPromos() {
   const [menu, promos] = await Promise.all([
     fetchMenuOnly().catch(()=>[]),
@@ -186,7 +186,7 @@ function renderTemplate(tpl, ctx = {}) {
   });
 }
 
-function buildSystemPromptFromDbTemplate(systemPromptTpl, session) {
+function buildSystemPromptFromDbTemplate(systemPromptTpl, session, hint = '') {
   const ctx = {
     callerId: session.callerId,
     nombreCliente: session.nombreCliente,
@@ -194,10 +194,25 @@ function buildSystemPromptFromDbTemplate(systemPromptTpl, session) {
     direccionConfirmada: session.direccionConfirmada ? 'sí' : 'no',
   };
   let prompt = renderTemplate(systemPromptTpl, ctx);
-  const menuStr = JSON.stringify(session.menu ?? []);
+  const menuStr   = JSON.stringify(session.menu ?? []);
   const promosStr = JSON.stringify(session.promos ?? []);
-  prompt += `\n\nMenú:\n${menuStr}\n\nPromociones:\n${promosStr}\n`;
-  return prompt.trim();
+  prompt += `
+
+Menú (JSON):
+${menuStr}
+
+Promociones (JSON):
+${promosStr}
+`.trim();
+
+  // Pista adicional opcional para el LLM según intención
+  if (hint) {
+    prompt += `
+
+Instrucción de turno:
+${hint}`.trim();
+  }
+  return prompt;
 }
 
 function isNoiseUtterance(str) {
@@ -235,7 +250,7 @@ async function extractEntities(userText) {
 
   if (!out.ultimoPedido) {
     const bebida = userText.match(/\b(coca[\-\s]?cola|sprite|fanta|gaseosa|cola)\b/i);
-    const pizza = userText.match(/\b(pizza\s+(?:de\s+)?[a-záéíóúñ]+|pepperoni|margarita|hawaiana)\b/i);
+    const pizza  = userText.match(/\b(pizza\s+(?:de\s+)?[a-záéíóúñ]+|pepperoni|margarita|hawaiana)\b/i);
     const extra = [];
     if (pizza) extra.push(pizza[0]);
     if (bebida) extra.push(bebida[0]);
@@ -248,13 +263,14 @@ async function extractEntities(userText) {
 }
 
 /* =========================
-   OPENAI CHAT (opcional)
+   OPENAI CHAT (texto generado SOLO por el LLM)
    ========================= */
 async function answerWithOpenAI_usingSystemPrompt(st, userText, systemPrompt) {
+  // Respuesta anti-ruido mínima (para no dejar silencio incómodo)
   if (isNoiseUtterance(userText)) {
     const canned = (st.session.step !== 'saludo')
       ? 'Sí, te escucho claro. ¿Qué te gustaría pedir?'
-      : 'Pizzería Don Napoli, hola. ¿Qué te gustaría pedir hoy?';
+      : 'Pizza Nostra, hola. ¿Qué te gustaría pedir hoy?';
     st.lastReplyText = canned;
     return canned;
   }
@@ -276,7 +292,7 @@ async function answerWithOpenAI_usingSystemPrompt(st, userText, systemPrompt) {
     body: JSON.stringify({
       model: 'gpt-4o-mini',
       temperature: 0.45,
-      max_tokens: 90,
+      max_tokens: 120,
       messages: [
         { role: 'system', content: systemPrompt || 'Responde útil y breve en español.' },
         ...recentHistory,
@@ -375,7 +391,7 @@ function createMulawSender(ws, sid, frameBytes = 160, frameMs = 20, prebufferByt
    ========================= */
 function buildSSMLFromText(text) {
   const style  = envStr('AZURE_TTS_STYLE', 'customerservice');
-  const rate   = envStr('AZURE_TTS_RATE', '1.3'); // puedes cambiar a '+20%' si prefieres porcentaje
+  const rate   = envStr('AZURE_TTS_RATE', '1.3');
   const pitch  = envStr('AZURE_TTS_PITCH', '+2%');
   const volume = envStr('AZURE_TTS_VOLUME', 'default');
   const pause  = envNum('AZURE_TTS_PAUSE_MS', 250);
@@ -553,7 +569,7 @@ async function persistSnapshotFromText(st, assistantReplyText) {
 
   // IMPORTANTE: guardar por llamada → caller_id = callSid; número del cliente en numero_telefono
   const snapshot = {
-    callerId: st.session.callSid || st.session.callerId || null,     // ahora prioriza callSid
+    callerId: st.session.callSid || st.session.callerId || null,     // prioriza callSid
     nombreCliente: ents.nombreCliente ?? st.session.nombreCliente ?? null,
     numeroTelefono: st.session.callerId || st.session.numeroTelefono || null,
     ultimoPedido: ents.ultimoPedido ?? st.session.ultimoPedido ?? null,
@@ -588,45 +604,27 @@ async function handleCompleteUserTurn(twilioSocket, streamSid, st) {
     logToN8n({ streamSid, type: 'user_turn_finalized', role: 'user', mensaje: humanText, ts: new Date().toISOString() });
 
     const intent = classifyIntent(humanText);
-    let reply;
 
-    // Intenciones con consulta directa a BD según lo pedido
+    // ===== Sin textos estáticos: solo actualizamos estado/datos y dejamos hablar al LLM =====
+    let hint = ''; // pista breve para el LLM en este turno
     if (intent === 'ask_menu') {
-      const menu = await fetchMenuOnly();
-      st.session.menu = menu;
-      if (menu.length) {
-        const lista = menu.map(m => `${m.nombre} ($${Number(m.precio).toFixed(2)})`).join(', ');
-        reply = `Nuestro menú: ${lista}. ¿Cuál prefieres?`;
-      } else {
-        reply = 'Ahora mismo no tengo menú disponible. ¿Deseas que lo intente de nuevo más tarde?';
-      }
-
+      st.session.menu = await fetchMenuOnly();
+      hint = 'El usuario pidió MENÚ: usa 3–5 opciones con nombre y precio desde el JSON Menú. No inventes.';
     } else if (intent === 'ask_promos') {
-      const promos = await fetchPromosOnly();
-      st.session.promos = promos;
-      if (promos.length) {
-        const activas = promos
-          .filter(p => p.activa)
-          .map(p => `${p.titulo}: ${p.descripcion}`).join(' | ');
-        reply = activas
-          ? `Promociones activas: ${activas}. ¿Te interesa alguna?`
-          : 'Por ahora no hay promociones activas. Igual puedo recomendarte opciones ricas del menú.';
-      } else {
-        reply = 'No encontré promociones activas en este momento.';
-      }
-
+      st.session.promos = await fetchPromosOnly();
+      hint = 'El usuario pidió PROMOCIONES: usa 1–2 activas del JSON Promociones. No inventes.';
     } else if (intent === 'confirm_address') {
       st.session.direccionConfirmada = true;
-      reply = 'Gracias por confirmar. ¿Deseas agregar algo más o finalizamos tu pedido?';
-
+      hint = 'El usuario confirmó dirección: continúa el flujo de cierre según reglas.';
     } else if (intent === 'closing') {
-      reply = 'Gracias por tu pedido. ¡Que tengas un excelente día! 😊';
-
-    } else {
-      if (!st._config) st._config = await fetchBotConfig();
-      const sysPrompt = buildSystemPromptFromDbTemplate(st._config?.systemPrompt || '', st.session);
-      reply = await answerWithOpenAI_usingSystemPrompt(st, humanText, sysPrompt);
+      hint = 'El usuario está cerrando: confirma pedido final y despídete cordialmente.';
     }
+
+    if (!st._config) st._config = await fetchBotConfig();
+    const sysPrompt = buildSystemPromptFromDbTemplate(st._config?.systemPrompt || '', st.session, hint);
+
+    // Genera la respuesta solo con el LLM (sin plantillas fijas)
+    const reply = await answerWithOpenAI_usingSystemPrompt(st, humanText, sysPrompt);
 
     // Enviar TTS
     stopTTS(twilioSocket, streamSid, 'before_new_reply');
@@ -762,7 +760,7 @@ wss.on('connection', async (twilioSocket, req) => {
 
           // Saludo inicial desde BD
           if (!st.hasGreeted) {
-            const greetingTpl = st._config?.greeting || 'Hola, somos Pizzería Don Napoli. ¿Qué te gustaría pedir hoy?';
+            const greetingTpl = st._config?.greeting || '¡Hola! Hablas con Martina de Pizza Nostra. ¿Qué te gustaría pedir hoy?';
             const saludo = renderTemplate(greetingTpl, {
               callerId: st.session.callerId,
               nombreCliente: st.session.nombreCliente,
