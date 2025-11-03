@@ -1,4 +1,4 @@
-// index.mjs — Voice Assistant (Twilio WS) + Deepgram STT + Azure TTS + n8n (BD)
+// index.mjs — Asistente de Voz (Twilio WS) + Deepgram STT + Azure TTS + n8n (BD)
 // TwiML: <Connect><Stream track="both_tracks" url="wss://TU_HOST/twilio" /></Connect>
 
 import express from 'express';
@@ -12,7 +12,7 @@ import { processFrame, clearVadState } from './vad.mjs';
 dotenv.config();
 
 /* =========================
-   ENV HELPERS
+   AYUDAS DE ENTORNO
    ========================= */
 const envStr = (k, d) => {
   const v = process.env[k];
@@ -36,7 +36,7 @@ app.use('/public', express.static(path.join(__dirname, 'public')));
 app.use(express.json({ limit: '10mb' }));
 
 /* =========================
-   EXTERNAL SERVICES
+   SERVICIOS EXTERNOS
    ========================= */
 const deepgram = createClient(envStr('DEEPGRAM_API_KEY', ''));
 
@@ -48,10 +48,10 @@ const AZURE_TTS_VOICE     = envStr('AZURE_TTS_VOICE', 'es-MX-DaliaNeural');
 // n8n
 const N8N_BASE_URL      = envStr('N8N_BASE_URL', '');
 const N8N_SHARED_SECRET = envStr('N8N_SHARED_SECRET', 'pizzeriadonnapoliSUPERSECRETO');
-const N8N_WEBHOOK_URL   = envStr('N8N_WEBHOOK_URL', ''); // opcional logs
+const N8N_WEBHOOK_URL   = envStr('N8N_WEBHOOK_URL', ''); // opcional para logs
 
 /* =========================
-   n8n HELPERS
+   AYUDAS PARA n8n
    ========================= */
 async function callN8n(payloadObj) {
   if (!N8N_BASE_URL) {
@@ -95,7 +95,7 @@ const toNullIfEmpty = (v) => {
   const s = String(v).trim();
   if (!s) return null;
   const low = s.toLowerCase();
-  // limpia "null", "undefined", "NaN" como texto
+  // limpia "null", "undefined", "NaN" como texto literal
   if (low === 'undefined' || low === 'null' || low === 'nan') return null;
   return s;
 };
@@ -113,14 +113,36 @@ async function fetchClientMemory(callerId) {
   };
 }
 
-async function fetchMenuAndPromos() {
+/* ===== NUEVO: helpers explícitos para menú y promos ===== */
+async function fetchMenuOnly() {
   const out = await callN8n({ action: 'get_menu' });
-  if (!out) return { menu: [], promos: [] };
-  let menu = [], promos = [];
-  try {
-    menu = Array.isArray(out.menu) ? out.menu : [];
-    promos = Array.isArray(out.promos) ? out.promos : [];
-  } catch {}
+  const menu = Array.isArray(out?.menu) ? out.menu : (Array.isArray(out) ? out : []);
+  return menu.map(r => ({
+    id: r.id,
+    nombre: r.nombre,
+    descripcion: r.descripcion,
+    precio: Number(r.precio),
+    disponible: !!r.disponible
+  }));
+}
+
+async function fetchPromosOnly() {
+  const out = await callN8n({ action: 'get_promos' });
+  const promos = Array.isArray(out?.promos) ? out.promos : (Array.isArray(out) ? out : []);
+  return promos.map(r => ({
+    id: r.id,
+    titulo: r.titulo,
+    descripcion: r.descripcion,
+    activa: !!r.activa
+  }));
+}
+
+// (opcional) combinado, reusado en precarga inicial
+async function fetchMenuAndPromos() {
+  const [menu, promos] = await Promise.all([
+    fetchMenuOnly().catch(()=>[]),
+    fetchPromosOnly().catch(()=>[])
+  ]);
   return { menu, promos };
 }
 
@@ -151,7 +173,7 @@ async function fetchBotConfig() {
 }
 
 /* =========================
-   TEMPLATE & PROMPTS
+   PLANTILLAS Y PROMPTS
    ========================= */
 function renderTemplate(tpl, ctx = {}) {
   if (!tpl) return '';
@@ -200,7 +222,7 @@ function classifyIntent(text) {
 }
 
 /* =========================
-   ENTITY EXTRACTION (heurística simple)
+   EXTRACCIÓN DE ENTIDADES (heurística simple)
    ========================= */
 async function extractEntities(userText) {
   const out = { nombreCliente: null, ultimoPedido: null };
@@ -221,12 +243,12 @@ async function extractEntities(userText) {
   }
 
   out.nombreCliente = toNullIfEmpty(out.nombreCliente);
-  out.ultimoPedido = toNullIfEmpty(out.ultimoPedido);
+  out.ultimoPedido  = toNullIfEmpty(out.ultimoPedido);
   return out;
 }
 
 /* =========================
-   OPENAI CHAT
+   OPENAI CHAT (opcional)
    ========================= */
 async function answerWithOpenAI_usingSystemPrompt(st, userText, systemPrompt) {
   if (isNoiseUtterance(userText)) {
@@ -280,7 +302,7 @@ async function answerWithOpenAI_usingSystemPrompt(st, userText, systemPrompt) {
 }
 
 /* =========================
-   AUDIO UTILS / Mu-law pacing
+   UTILIDADES DE AUDIO / Pacing µ-law
    ========================= */
 const ULAW_TAB = new Int16Array(256);
 (function buildUlawTable() {
@@ -349,11 +371,11 @@ function createMulawSender(ws, sid, frameBytes = 160, frameMs = 20, prebufferByt
 }
 
 /* =========================
-   Azure TTS
+   AZURE TTS
    ========================= */
 function buildSSMLFromText(text) {
   const style  = envStr('AZURE_TTS_STYLE', 'customerservice');
-  const rate   = envStr('AZURE_TTS_RATE', '1.3');
+  const rate   = envStr('AZURE_TTS_RATE', '1.3'); // puedes cambiar a '+20%' si prefieres porcentaje
   const pitch  = envStr('AZURE_TTS_PITCH', '+2%');
   const volume = envStr('AZURE_TTS_VOLUME', 'default');
   const pause  = envNum('AZURE_TTS_PAUSE_MS', 250);
@@ -434,7 +456,7 @@ async function speakWithAzureTTS(ws, streamSid, text) {
       const slice = buf.subarray(i, Math.min(i + CHUNK, buf.length));
       st.ttsSender?.push(slice);
     }
-    // colita de silencio (~120ms)
+    // pequeña cola de silencio (~120ms)
     const tail = Buffer.alloc(160 * 6, 0xff);
     st.ttsSender?.push(tail);
 
@@ -446,21 +468,21 @@ async function speakWithAzureTTS(ws, streamSid, text) {
 }
 
 /* =========================
-   STATE BY CALL
+   ESTADO POR LLAMADA
    ========================= */
-const statesByCall = new Map(); // callSid -> state
+const statesByCall = new Map(); // callSid -> estado
 const streamToCall = new Map(); // streamSid -> callSid
-const streams      = new Map(); // streamSid -> twilio WS
+const streams      = new Map(); // streamSid -> socket Twilio
 let activePrimarySid = null;
 
 function ensureCallState(callSid) {
   if (!statesByCall.has(callSid)) {
     statesByCall.set(callSid, {
       session: {
-        callerId: null,
-        callSid,
+        callerId: null,           // número del cliente (E.164)
+        callSid,                  // ID único de la llamada
         nombreCliente: null,
-        numeroTelefono: null,      // ← se llenará con el número del cliente
+        numeroTelefono: null,     // número del cliente para persistir
         direccionConfirmada: false,
         modo: 'venta',
         step: 'saludo',
@@ -485,7 +507,7 @@ function ensureCallState(callSid) {
       hasGreeted: false,
       dgSocket: null,
       stopHeartbeat: null,
-      _config: null, // greeting/systemPrompt cache
+      _config: null, // cache de saludo/prompt
     });
   }
   return statesByCall.get(callSid);
@@ -497,7 +519,7 @@ function normalizeSid(v) {
 }
 
 /* =========================
-   HEARTBEAT Deepgram
+   HEARTBEAT PARA DEEPGRAM
    ========================= */
 const SILENCE_FRAME = Buffer.alloc(160, 0xff);
 function startDeepgramHeartbeat(dgSocket) {
@@ -522,16 +544,16 @@ function startDeepgramHeartbeat(dgSocket) {
 }
 
 /* =========================
-   TURN HANDLER
+   MANEJO DE TURNOS (usuario → asistente)
    ========================= */
 async function persistSnapshotFromText(st, assistantReplyText) {
   const ents = await extractEntities(st.lastUserTurnHandled || st.partialBuffer || '');
   const text = (st.lastUserTurnHandled || '').toLowerCase();
   const direccionConfirmada = st.session.direccionConfirmada || /\b(confirmo|es correcto|sí,? confirmo|sí confirmo)\b/.test(text);
 
-  // SIEMPRE guarda el número que llama en numeroTelefono
+  // IMPORTANTE: guardar por llamada → caller_id = callSid; número del cliente en numero_telefono
   const snapshot = {
-    callerId: st.session.callerId || st.session.callSid || null,
+    callerId: st.session.callSid || st.session.callerId || null,     // ahora prioriza callSid
     nombreCliente: ents.nombreCliente ?? st.session.nombreCliente ?? null,
     numeroTelefono: st.session.callerId || st.session.numeroTelefono || null,
     ultimoPedido: ents.ultimoPedido ?? st.session.ultimoPedido ?? null,
@@ -539,7 +561,7 @@ async function persistSnapshotFromText(st, assistantReplyText) {
     ultimoMensajeAsistente: assistantReplyText || st.lastReplyText || null,
   };
 
-  // aplica al estado y persiste
+  // aplicar al estado y persistir
   st.session.nombreCliente        = snapshot.nombreCliente;
   st.session.numeroTelefono       = snapshot.numeroTelefono;
   st.session.ultimoPedido         = snapshot.ultimoPedido;
@@ -568,34 +590,49 @@ async function handleCompleteUserTurn(twilioSocket, streamSid, st) {
     const intent = classifyIntent(humanText);
     let reply;
 
-    // Intenciones de datos primero (menú/promos)
-    if (intent === 'ask_menu' || intent === 'ask_promos') {
-      const data = await fetchMenuAndPromos();
-      if (intent === 'ask_menu') {
-        st.session.menu = data.menu || [];
-        const top = (st.session.menu || []).slice(0, 3).map(m => `${m.nombre} ($${Number(m.precio).toFixed(2)})`).join(', ');
-        reply = top ? `Te cuento algunas opciones: ${top}. ¿Cuál prefieres?` : 'Ahora mismo no tengo menú disponible. ¿Quieres que lo intente de nuevo más tarde?';
+    // Intenciones con consulta directa a BD según lo pedido
+    if (intent === 'ask_menu') {
+      const menu = await fetchMenuOnly();
+      st.session.menu = menu;
+      if (menu.length) {
+        const lista = menu.map(m => `${m.nombre} ($${Number(m.precio).toFixed(2)})`).join(', ');
+        reply = `Nuestro menú: ${lista}. ¿Cuál prefieres?`;
       } else {
-        st.session.promos = data.promos || [];
-        const act = (st.session.promos || []).filter(p => p.activa).slice(0, 2).map(p => `${p.titulo}: ${p.descripcion}`).join(' | ');
-        reply = act ? `Promos activas: ${act}. ¿Te interesa alguna?` : 'Por ahora no hay promociones activas. Igual puedo recomendarte opciones ricas del menú.';
+        reply = 'Ahora mismo no tengo menú disponible. ¿Deseas que lo intente de nuevo más tarde?';
       }
+
+    } else if (intent === 'ask_promos') {
+      const promos = await fetchPromosOnly();
+      st.session.promos = promos;
+      if (promos.length) {
+        const activas = promos
+          .filter(p => p.activa)
+          .map(p => `${p.titulo}: ${p.descripcion}`).join(' | ');
+        reply = activas
+          ? `Promociones activas: ${activas}. ¿Te interesa alguna?`
+          : 'Por ahora no hay promociones activas. Igual puedo recomendarte opciones ricas del menú.';
+      } else {
+        reply = 'No encontré promociones activas en este momento.';
+      }
+
     } else if (intent === 'confirm_address') {
       st.session.direccionConfirmada = true;
       reply = 'Gracias por confirmar. ¿Deseas agregar algo más o finalizamos tu pedido?';
+
     } else if (intent === 'closing') {
       reply = 'Gracias por tu pedido. ¡Que tengas un excelente día! 😊';
+
     } else {
       if (!st._config) st._config = await fetchBotConfig();
       const sysPrompt = buildSystemPromptFromDbTemplate(st._config?.systemPrompt || '', st.session);
       reply = await answerWithOpenAI_usingSystemPrompt(st, humanText, sysPrompt);
     }
 
-    // Envía TTS
+    // Enviar TTS
     stopTTS(twilioSocket, streamSid, 'before_new_reply');
     await speakWithAzureTTS(twilioSocket, streamSid, reply);
 
-    // Historial y buffers
+    // Actualizar historial y buffers
     st.history.push({ role: 'assistant', content: reply });
     if (st.history.length > 30) st.history.splice(0, st.history.length - 30);
     st.lastUserTurnHandled      = humanText;
@@ -638,7 +675,7 @@ function readStartParam(msg, key) {
 }
 
 /* =========================
-   WSS / Twilio
+   WEBSOCKET / Twilio
    ========================= */
 const wss = new WebSocketServer({ noServer: true });
 const RMS_BARGE_THRESHOLD = 0.05;
@@ -667,23 +704,23 @@ wss.on('connection', async (twilioSocket, req) => {
       const st = ensureCallState(callSid);
       console.log('▶️ start streamSid:', streamSid, 'callSid:', callSid, '| streams activos:', streams.size);
 
-      // Lee parámetros robustamente
-      const fromParam = readStartParam(msg, 'from');        // número del cliente E.164
+      // Parámetros de inicio de Twilio
+      const fromParam = readStartParam(msg, 'from');        // número del cliente (E.164)
       const toParam   = readStartParam(msg, 'to');          // número de tu línea Twilio
       const nameParam = readStartParam(msg, 'callerName');  // opcional
 
-      // Fallback por si Twilio no mandó customParameters
+      // Fallback si Twilio no envió customParameters
       const fallbackFrom = msg.start?.from || msg.start?.caller || null;
 
       // Guardar en sesión
       st.session.callerId       = toNullIfEmpty(fromParam) || toNullIfEmpty(fallbackFrom) || callSid || 'desconocido';
-      st.session.numeroTelefono = st.session.callerId; // persistiremos este número
+      st.session.numeroTelefono = st.session.callerId; // este es el número del cliente que persistiremos
       st.session.toNumber       = toNullIfEmpty(toParam) || st.session.toNumber || null;
       st.session.callerName     = toNullIfEmpty(nameParam) || st.session.callerName || null;
 
       st.bargeStreak = 0;
 
-      // Reusar DG si ya existe en la llamada; si no, crear
+      // Crear conexión con Deepgram (o reusar si ya existe en la llamada)
       if (!st.dgSocket) {
         const dgSocket = await deepgram.listen.live({
           model: 'nova-3',
@@ -702,13 +739,13 @@ wss.on('connection', async (twilioSocket, req) => {
           console.log('🎤 DG abierto callSid:', callSid, 'streamSid:', streamSid);
           st.stopHeartbeat = startDeepgramHeartbeat(dgSocket);
 
-          // Precarga inicial (una sola vez por llamada)
+          // Precarga una vez por llamada (config, memoria y datos)
           if (!st._config) {
             st._config = await fetchBotConfig();
           }
           if ((st.session.menu?.length ?? 0) === 0 && (st.session.promos?.length ?? 0) === 0) {
             try {
-              const [memData, menuData] = await Promise.all([
+              const [memData, data] = await Promise.all([
                 fetchClientMemory(st.session.callerId),
                 fetchMenuAndPromos(),
               ]);
@@ -718,12 +755,12 @@ wss.on('connection', async (twilioSocket, req) => {
                 if (memData.direccionConfirmada)  st.session.direccionConfirmada  = !!memData.direccionConfirmada;
                 if (memData.ultimoPedido)         st.session.ultimoPedido         = memData.ultimoPedido;
               }
-              st.session.menu   = menuData?.menu   || [];
-              st.session.promos = menuData?.promos || [];
+              st.session.menu   = data?.menu   || [];
+              st.session.promos = data?.promos || [];
             } catch (e) { console.error('precarga error:', e?.message || e); }
           }
 
-          // Saludo desde BD
+          // Saludo inicial desde BD
           if (!st.hasGreeted) {
             const greetingTpl = st._config?.greeting || 'Hola, somos Pizzería Don Napoli. ¿Qué te gustaría pedir hoy?';
             const saludo = renderTemplate(greetingTpl, {
@@ -790,7 +827,7 @@ wss.on('connection', async (twilioSocket, req) => {
       const audioUlaw = Buffer.from(payload, 'base64');
       if (audioUlaw.length === 0) return;
 
-      // Barge-in
+      // Barge-in (interrupción del cliente)
       const vadInfoOpenLike = processFrame(streamSid, audioUlaw);
       const callerTalking   = !!vadInfoOpenLike.open;
       if (st.ttsActive) {
@@ -809,7 +846,7 @@ wss.on('connection', async (twilioSocket, req) => {
         st.bargeStreak = 0;
       }
 
-      // enviar a Deepgram
+      // enviar audio a Deepgram
       if (st.dgSocket) {
         try { st.dgSocket.send(audioUlaw); } catch (e) {
           console.error('❌ DG send error', e?.message || e);
@@ -831,8 +868,9 @@ wss.on('connection', async (twilioSocket, req) => {
         stopTTS(twilioSocket, streamSid, 'stop');
         const st = callSid ? statesByCall.get(callSid) : null;
         if (st) {
+          // IMPORTANTE: callerId = callSid; numeroTelefono = número del cliente
           await pushClientMemoryUpdate({
-            callerId: st.session.callerId || null,
+            callerId: st.session.callSid || null,
             nombreCliente: st.session.nombreCliente || null,
             numeroTelefono: st.session.callerId || st.session.numeroTelefono || null,
             ultimoPedido: st.session.ultimoPedido || null,
@@ -868,8 +906,9 @@ wss.on('connection', async (twilioSocket, req) => {
     stopTTS(twilioSocket, streamSid, 'close');
     const st = callSid ? statesByCall.get(callSid) : null;
     if (st) {
+      // IMPORTANTE: callerId = callSid; numeroTelefono = número del cliente
       await pushClientMemoryUpdate({
-        callerId: st.session.callerId || null,
+        callerId: st.session.callSid || null,
         nombreCliente: st.session.nombreCliente || null,
         numeroTelefono: st.session.callerId || st.session.numeroTelefono || null,
         ultimoPedido: st.session.ultimoPedido || null,
@@ -888,7 +927,7 @@ wss.on('connection', async (twilioSocket, req) => {
 });
 
 /* =========================
-   KEEPALIVE WSS
+   KEEPALIVE DEL WSS
    ========================= */
 const PING_EVERY_MS = 25000;
 setInterval(() => {
@@ -898,7 +937,7 @@ setInterval(() => {
 wss.on('error', (err) => console.error('❌ WSS error:', err));
 
 /* =========================
-   HTTP + UPGRADE
+   HTTP + UPGRADE A WS
    ========================= */
 app.server = app.listen(port, () => {
   console.log(`🚀 Servidor escuchando en http://localhost:${port}`);
