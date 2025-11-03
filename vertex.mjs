@@ -95,7 +95,6 @@ const toNullIfEmpty = (v) => {
   const s = String(v).trim();
   if (!s) return null;
   const low = s.toLowerCase();
-  // limpia "null", "undefined", "NaN" como texto
   if (low === 'undefined' || low === 'null' || low === 'nan') return null;
   return s;
 };
@@ -113,16 +112,46 @@ async function fetchClientMemory(callerId) {
   };
 }
 
+/* === Opción 1 aplicada: normalización y lectura correcta de promos === */
+function truthy(v) {
+  if (typeof v === 'boolean') return v;
+  if (v == null) return false;
+  const s = String(v).trim().toLowerCase();
+  return s === 'true' || s === '1' || s === 't' || s === 'yes' || s === 'y';
+}
+
+function normalizeMenu(menuRaw) {
+  if (!Array.isArray(menuRaw)) return [];
+  // Evita colar promos dentro de menu si el flujo llega a mezclar
+  return menuRaw.filter(m => (m.nombre || m.descripcion || m.precio != null || m.disponible != null));
+}
+
+function normalizePromos(promosRaw) {
+  if (!Array.isArray(promosRaw)) return [];
+  return promosRaw.map(p => ({
+    id: p.id,
+    titulo: p.titulo || p.nombre || 'Promo',
+    descripcion: p.descripcion || '',
+    activa: truthy(p.activa),
+  }));
+}
+
 async function fetchMenuAndPromos() {
-  const out = await callN8n({ action: 'get_menu'||'get_promos' });
-  if (!out) return { menu: [], promos: [] };
-  let menu = [], promos = [];
-  try {
-    menu = Array.isArray(out.menu) ? out.menu : [];
-    promos = Array.isArray(out.promos) ? out.promos : [];
-  } catch {}
+  // Tu flujo ya devuelve menu + promos cuando llamas get_promos
+  const out = await callN8n({ action: 'get_promos' });
+  if (!out || typeof out !== 'object') {
+    console.warn('⚠️ n8n no devolvió objeto en get_promos');
+    return { menu: [], promos: [] };
+  }
+
+  try { console.log('🧾 n8n get_promos →', JSON.stringify(out)); } catch {}
+  const menu   = normalizeMenu(out.menu || []);
+  const promos = normalizePromos(out.promos || []);
+  const activas = promos.filter(p => p.activa);
+  console.log(`✅ normalizado menu: ${menu.length} promos: ${promos.length} activas: ${activas.length}`);
   return { menu, promos };
 }
+/* === /Opción 1 === */
 
 function sanitizeSnapshot(x = {}) {
   return {
@@ -529,7 +558,6 @@ async function persistSnapshotFromText(st, assistantReplyText) {
   const text = (st.lastUserTurnHandled || '').toLowerCase();
   const direccionConfirmada = st.session.direccionConfirmada || /\b(confirmo|es correcto|sí,? confirmo|sí confirmo)\b/.test(text);
 
-  // SIEMPRE guarda el número que llama en numeroTelefono
   const snapshot = {
     callerId: st.session.callerId || st.session.callSid || null,
     nombreCliente: ents.nombreCliente ?? st.session.nombreCliente ?? null,
@@ -539,7 +567,6 @@ async function persistSnapshotFromText(st, assistantReplyText) {
     ultimoMensajeAsistente: assistantReplyText || st.lastReplyText || null,
   };
 
-  // aplica al estado y persiste
   st.session.nombreCliente        = snapshot.nombreCliente;
   st.session.numeroTelefono       = snapshot.numeroTelefono;
   st.session.ultimoPedido         = snapshot.ultimoPedido;
@@ -618,16 +645,13 @@ function readStartParam(msg, key) {
   const raw = msg?.start?.customParameters;
   if (!raw) return null;
 
-  // Array tipo [{name,value}]
   if (Array.isArray(raw)) {
     const hit = raw.find(p => (p?.name === key) || (p?.Name === key));
     return hit?.value ?? hit?.Value ?? null;
   }
-  // Objeto tipo { from:"+593...", to:"...", callerName:"..." }
   if (typeof raw === 'object') {
     return raw[key] ?? raw[key?.toLowerCase?.()] ?? raw[key?.toUpperCase?.()] ?? null;
   }
-  // String tipo querystring
   if (typeof raw === 'string') {
     try {
       const params = new URLSearchParams(raw);
@@ -667,23 +691,19 @@ wss.on('connection', async (twilioSocket, req) => {
       const st = ensureCallState(callSid);
       console.log('▶️ start streamSid:', streamSid, 'callSid:', callSid, '| streams activos:', streams.size);
 
-      // Lee parámetros robustamente
-      const fromParam = readStartParam(msg, 'from');        // número del cliente E.164
-      const toParam   = readStartParam(msg, 'to');          // número de tu línea Twilio
-      const nameParam = readStartParam(msg, 'callerName');  // opcional
+      const fromParam = readStartParam(msg, 'from');
+      const toParam   = readStartParam(msg, 'to');
+      const nameParam = readStartParam(msg, 'callerName');
 
-      // Fallback por si Twilio no mandó customParameters
       const fallbackFrom = msg.start?.from || msg.start?.caller || null;
 
-      // Guardar en sesión
       st.session.callerId       = toNullIfEmpty(fromParam) || toNullIfEmpty(fallbackFrom) || callSid || 'desconocido';
-      st.session.numeroTelefono = st.session.callerId; // persistiremos este número
+      st.session.numeroTelefono = st.session.callerId;
       st.session.toNumber       = toNullIfEmpty(toParam) || st.session.toNumber || null;
       st.session.callerName     = toNullIfEmpty(nameParam) || st.session.callerName || null;
 
       st.bargeStreak = 0;
 
-      // Reusar DG si ya existe en la llamada; si no, crear
       if (!st.dgSocket) {
         const dgSocket = await deepgram.listen.live({
           model: 'nova-3',
@@ -702,7 +722,6 @@ wss.on('connection', async (twilioSocket, req) => {
           console.log('🎤 DG abierto callSid:', callSid, 'streamSid:', streamSid);
           st.stopHeartbeat = startDeepgramHeartbeat(dgSocket);
 
-          // Precarga inicial (una sola vez por llamada)
           if (!st._config) {
             st._config = await fetchBotConfig();
           }
@@ -723,7 +742,6 @@ wss.on('connection', async (twilioSocket, req) => {
             } catch (e) { console.error('precarga error:', e?.message || e); }
           }
 
-          // Saludo desde BD
           if (!st.hasGreeted) {
             const greetingTpl = st._config?.greeting ;
             const saludo = renderTemplate(greetingTpl, {
@@ -790,7 +808,6 @@ wss.on('connection', async (twilioSocket, req) => {
       const audioUlaw = Buffer.from(payload, 'base64');
       if (audioUlaw.length === 0) return;
 
-      // Barge-in
       const vadInfoOpenLike = processFrame(streamSid, audioUlaw);
       const callerTalking   = !!vadInfoOpenLike.open;
       if (st.ttsActive) {
@@ -809,7 +826,6 @@ wss.on('connection', async (twilioSocket, req) => {
         st.bargeStreak = 0;
       }
 
-      // enviar a Deepgram
       if (st.dgSocket) {
         try { st.dgSocket.send(audioUlaw); } catch (e) {
           console.error('❌ DG send error', e?.message || e);
