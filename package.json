@@ -1,6 +1,7 @@
 {
   "dependencies": {
     "@deepgram/sdk": "^4.11.2",
+    "@google-cloud/text-to-speech": "^6.4.0",
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
     "microsoft-cognitiveservices-speech-sdk": "^1.46.0",
