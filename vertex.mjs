@@ -95,10 +95,19 @@ const toNullIfEmpty = (v) => {
   const s = String(v).trim();
   if (!s) return null;
   const low = s.toLowerCase();
-  // limpia "null", "undefined", "NaN" como texto
   if (low === 'undefined' || low === 'null' || low === 'nan') return null;
   return s;
 };
+
+function normalizeBool(v) {
+  if (typeof v === 'boolean') return v;
+  if (typeof v === 'number') return v !== 0;
+  if (typeof v === 'string') {
+    const t = v.trim().toLowerCase();
+    return ['true','1','t','yes','y','si','sí','activo','activa'].includes(t);
+  }
+  return false;
+}
 
 async function fetchClientMemory(callerId) {
   const out = await callN8n({ action: 'get_memory', callerId });
@@ -114,13 +123,36 @@ async function fetchClientMemory(callerId) {
 }
 
 async function fetchMenuAndPromos() {
-  const out = await callN8n({ action: 'get_menu'||'get_promos' });
+  // Llama a tu webhook principal (get_menu) que devuelve { menu, promos } o { menu, promociones }
+  const out = await callN8n({ action: 'get_menu' });
   if (!out) return { menu: [], promos: [] };
+
+  try { console.log('🧾 n8n get_menu →', JSON.stringify(out).slice(0, 1000)); } catch {}
+
   let menu = [], promos = [];
   try {
     menu = Array.isArray(out.menu) ? out.menu : [];
-    promos = Array.isArray(out.promos) ? out.promos : [];
+
+    const rawPromos = Array.isArray(out.promos)
+      ? out.promos
+      : (Array.isArray(out.promociones) ? out.promociones : []);
+
+    promos = rawPromos.map(p => ({
+      ...p,
+      titulo: p.titulo ?? p.title ?? p.nombre ?? p.name ?? 'Promoción',
+      descripcion: p.descripcion ?? p.detalle ?? p.description ?? '',
+      activa: normalizeBool(p.activa ?? p.active ?? p.is_active ?? p.estado),
+    }));
+  } catch (e) {
+    console.error('❌ parse get_menu:', e?.message || e);
+  }
+
+  try {
+    console.log('✅ normalizado menu:', menu.length,
+                'promos:', promos.length,
+                'activas:', promos.filter(p=>p.activa).length);
   } catch {}
+
   return { menu, promos };
 }
 
@@ -434,7 +466,6 @@ async function speakWithAzureTTS(ws, streamSid, text) {
       const slice = buf.subarray(i, Math.min(i + CHUNK, buf.length));
       st.ttsSender?.push(slice);
     }
-    // colita de silencio (~120ms)
     const tail = Buffer.alloc(160 * 6, 0xff);
     st.ttsSender?.push(tail);
 
@@ -493,7 +524,7 @@ function ensureCallState(callSid) {
 
 function normalizeSid(v) {
   if (v == null) return '';
-  return String(v).replace(/^=\s*/, '').trim();
+  return String(v).replace(/^\=\s*/, '').trim();
 }
 
 /* =========================
@@ -529,7 +560,6 @@ async function persistSnapshotFromText(st, assistantReplyText) {
   const text = (st.lastUserTurnHandled || '').toLowerCase();
   const direccionConfirmada = st.session.direccionConfirmada || /\b(confirmo|es correcto|sí,? confirmo|sí confirmo)\b/.test(text);
 
-  // SIEMPRE guarda el número que llama en numeroTelefono
   const snapshot = {
     callerId: st.session.callerId || st.session.callSid || null,
     nombreCliente: ents.nombreCliente ?? st.session.nombreCliente ?? null,
@@ -539,7 +569,6 @@ async function persistSnapshotFromText(st, assistantReplyText) {
     ultimoMensajeAsistente: assistantReplyText || st.lastReplyText || null,
   };
 
-  // aplica al estado y persiste
   st.session.nombreCliente        = snapshot.nombreCliente;
   st.session.numeroTelefono       = snapshot.numeroTelefono;
   st.session.ultimoPedido         = snapshot.ultimoPedido;
@@ -571,20 +600,37 @@ async function handleCompleteUserTurn(twilioSocket, streamSid, st) {
     // Intenciones de datos primero (menú/promos)
     if (intent === 'ask_menu' || intent === 'ask_promos') {
       const data = await fetchMenuAndPromos();
+
       if (intent === 'ask_menu') {
         st.session.menu = data.menu || [];
-        const top = (st.session.menu || []).slice(0, 3).map(m => `${m.nombre} ($${Number(m.precio).toFixed(2)})`).join(', ');
-        reply = top ? `Te cuento algunas opciones: ${top}. ¿Cuál prefieres?` : 'Ahora mismo no tengo menú disponible. ¿Quieres que lo intente de nuevo más tarde?';
-      } else {
+        const top = (st.session.menu || [])
+          .slice(0, 3)
+          .map(m => `${m.nombre ?? m.name} ($${Number(m.precio ?? m.price ?? 0).toFixed(2)})`)
+          .join(', ');
+        reply = top
+          ? `Te cuento algunas opciones: ${top}. ¿Cuál prefieres?`
+          : 'Ahora mismo no tengo menú disponible. ¿Quieres que lo intente de nuevo más tarde?';
+
+      } else { // ask_promos
         st.session.promos = data.promos || [];
-        const act = (st.session.promos || []).filter(p => p.activa).slice(0, 2).map(p => `${p.titulo}: ${p.descripcion}`).join(' | ');
-        reply = act ? `Promos activas: ${act}. ¿Te interesa alguna?` : 'Por ahora no hay promociones activas. Igual puedo recomendarte opciones ricas del menú.';
+        const activas = (st.session.promos || [])
+          .filter(p => normalizeBool(p.activa))
+          .slice(0, 2)
+          .map(p => `${p.titulo}: ${p.descripcion}`)
+          .join(' | ');
+
+        reply = activas
+          ? `Promos activas: ${activas}. ¿Te interesa alguna?`
+          : 'Por ahora no hay promociones activas. Igual puedo recomendarte opciones ricas del menú.';
       }
+
     } else if (intent === 'confirm_address') {
       st.session.direccionConfirmada = true;
       reply = 'Gracias por confirmar. ¿Deseas agregar algo más o finalizamos tu pedido?';
+
     } else if (intent === 'closing') {
       reply = 'Gracias por tu pedido. ¡Que tengas un excelente día! 😊';
+
     } else {
       if (!st._config) st._config = await fetchBotConfig();
       const sysPrompt = buildSystemPromptFromDbTemplate(st._config?.systemPrompt || '', st.session);
@@ -618,16 +664,13 @@ function readStartParam(msg, key) {
   const raw = msg?.start?.customParameters;
   if (!raw) return null;
 
-  // Array tipo [{name,value}]
   if (Array.isArray(raw)) {
     const hit = raw.find(p => (p?.name === key) || (p?.Name === key));
     return hit?.value ?? hit?.Value ?? null;
   }
-  // Objeto tipo { from:"+593...", to:"...", callerName:"..." }
   if (typeof raw === 'object') {
     return raw[key] ?? raw[key?.toLowerCase?.()] ?? raw[key?.toUpperCase?.()] ?? null;
   }
-  // String tipo querystring
   if (typeof raw === 'string') {
     try {
       const params = new URLSearchParams(raw);
@@ -677,7 +720,7 @@ wss.on('connection', async (twilioSocket, req) => {
 
       // Guardar en sesión
       st.session.callerId       = toNullIfEmpty(fromParam) || toNullIfEmpty(fallbackFrom) || callSid || 'desconocido';
-      st.session.numeroTelefono = st.session.callerId; // persistiremos este número
+      st.session.numeroTelefono = st.session.callerId;
       st.session.toNumber       = toNullIfEmpty(toParam) || st.session.toNumber || null;
       st.session.callerName     = toNullIfEmpty(nameParam) || st.session.callerName || null;
 
@@ -723,9 +766,9 @@ wss.on('connection', async (twilioSocket, req) => {
             } catch (e) { console.error('precarga error:', e?.message || e); }
           }
 
-          // Saludo desde BD
+          // Saludo desde BD (con fallback)
           if (!st.hasGreeted) {
-            const greetingTpl = st._config?.greeting ;
+            const greetingTpl = st._config?.greeting || 'Hola, somos tu tienda. ¿Qué te gustaría pedir hoy?';
             const saludo = renderTemplate(greetingTpl, {
               callerId: st.session.callerId,
               nombreCliente: st.session.nombreCliente,
@@ -790,7 +833,6 @@ wss.on('connection', async (twilioSocket, req) => {
       const audioUlaw = Buffer.from(payload, 'base64');
       if (audioUlaw.length === 0) return;
 
-      // Barge-in
       const vadInfoOpenLike = processFrame(streamSid, audioUlaw);
       const callerTalking   = !!vadInfoOpenLike.open;
       if (st.ttsActive) {
@@ -809,7 +851,6 @@ wss.on('connection', async (twilioSocket, req) => {
         st.bargeStreak = 0;
       }
 
-      // enviar a Deepgram
       if (st.dgSocket) {
         try { st.dgSocket.send(audioUlaw); } catch (e) {
           console.error('❌ DG send error', e?.message || e);
