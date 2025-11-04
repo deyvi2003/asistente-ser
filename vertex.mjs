@@ -1,4 +1,5 @@
 // index.mjs — Asistente de Voz (Twilio WS) + Deepgram STT + Google Cloud TTS + n8n (BD)
+// Mejora de latencia: LLM streaming por frases -> TTS inmediato, prompt SLIM, endpointing 300ms
 // TwiML: <Connect><Stream track="both_tracks" url="wss://TU_HOST/twilio" /></Connect>
 
 import express from 'express';
@@ -6,7 +7,7 @@ import path from 'path';
 import { WebSocketServer } from 'ws';
 import { createClient, LiveTranscriptionEvents } from '@deepgram/sdk';
 import dotenv from 'dotenv';
-import fetch from 'node-fetch';
+const fetch = globalThis.fetch; // Node 18+
 import { processFrame, clearVadState } from './vad.mjs';
 
 // === Google Cloud TTS ===
@@ -15,6 +16,28 @@ import fs from 'fs';
 import os from 'os';
 
 dotenv.config();
+
+/* =========================
+   LOGGING (niveles + helpers)
+   ========================= */
+const LOG_LEVEL = (process.env.LOG_LEVEL || 'info').toLowerCase(); // debug|info|warn|error
+const LOG_MEDIA = String(process.env.LOG_MEDIA || '0') === '1';     // cuenta frames media
+const LOG_SSE_CHUNKS = String(process.env.LOG_SSE_CHUNKS || '0') === '1';
+const LOG_N8N_BODIES = String(process.env.LOG_N8N_BODIES || '0') === '1';
+
+const LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
+const CUR = LEVELS[LOG_LEVEL] ?? 1;
+const ts = () => new Date().toISOString().replace('T', ' ').replace('Z', '');
+
+const LOG = {
+  debug: (...a) => { if (CUR <= 0) console.log('🟦', ts(), ...a); },
+  info:  (...a) => { if (CUR <= 1) console.log('🟩', ts(), ...a); },
+  warn:  (...a) => { if (CUR <= 2) console.warn('🟨', ts(), ...a); },
+  error: (...a) => { if (CUR <= 3) console.error('🟥', ts(), ...a); },
+};
+
+LOG.info('[boot] LOG_LEVEL=%s | LOG_MEDIA=%s | LOG_SSE_CHUNKS=%s | LOG_N8N_BODIES=%s',
+  LOG_LEVEL, LOG_MEDIA ? 'on' : 'off', LOG_SSE_CHUNKS ? 'on' : 'off', LOG_N8N_BODIES ? 'on' : 'off');
 
 /* =========================
    AYUDAS DE ENTORNO
@@ -46,28 +69,69 @@ app.use(express.json({ limit: '10mb' }));
 const deepgram = createClient(envStr('DEEPGRAM_API_KEY', ''));
 
 // === Config Google TTS ===
-const GOOGLE_TTS_VOICE      = envStr('GOOGLE_TTS_VOICE', 'es-US-Chirp3-HD-Zephyr'); // Femenino
-const GOOGLE_TTS_LANGUAGE   = envStr('GOOGLE_TTS_LANGUAGE', 'es-US');
-const GOOGLE_TTS_RATE       = envStr('GOOGLE_TTS_RATE', '1.15'); // 0.25–4.0
-const GOOGLE_TTS_PITCH      = envStr('GOOGLE_TTS_PITCH', '0.0'); // -20.0–20.0 semitonos aprox
-const GOOGLE_TTS_EFFECTS    = envStr('GOOGLE_TTS_EFFECTS', 'telephony-class-application'); // perfíl para telefonía
+const GOOGLE_TTS_VOICE    = envStr('GOOGLE_TTS_VOICE', 'es-US-Chirp3-HD-Zephyr');
+const GOOGLE_TTS_LANGUAGE = envStr('GOOGLE_TTS_LANGUAGE', 'es-US');
+const GOOGLE_TTS_RATE     = envStr('GOOGLE_TTS_RATE', '1.10');
+const GOOGLE_TTS_PITCH    = envStr('GOOGLE_TTS_PITCH', '0.0');
+const GOOGLE_TTS_EFFECTS  = envStr('GOOGLE_TTS_EFFECTS', 'telephony-class-application');
+// ↓ más corto por defecto para respuesta rápida
+const GOOGLE_TTS_PAUSE_MS = envNum('GOOGLE_TTS_PAUSE_MS', 80);
 
-// Soporte credenciales por base64 (opcional)
-let gAuthClient = null;
-{
-  const keyB64 = process.env.GOOGLE_CLOUD_KEY_BASE64 || '';
+LOG.info('[config] PORT=%d | TTS voice=%s rate=%s pitch=%s', port, GOOGLE_TTS_VOICE, GOOGLE_TTS_RATE, GOOGLE_TTS_PITCH);
+
+/* ---------- Resolución robusta de credenciales Google ---------- */
+function setupGoogleCreds() {
+  const keyB64 = (process.env.GOOGLE_CLOUD_KEY_BASE64 || '').trim();
+  const keyJsonInline = (process.env.GOOGLE_CLOUD_KEY_JSON || '').trim();
+  let credPath = (process.env.GOOGLE_APPLICATION_CREDENTIALS || '').trim();
+
   if (keyB64) {
     try {
       const json = Buffer.from(keyB64, 'base64').toString('utf8');
       const tmp = path.join(os.tmpdir(), `gcp-key-${Date.now()}.json`);
-      fs.writeFileSync(tmp, json);
+      fs.writeFileSync(tmp, json, { encoding: 'utf8', mode: 0o600 });
       process.env.GOOGLE_APPLICATION_CREDENTIALS = tmp;
+      LOG.info('🔐 Google creds: usando GOOGLE_CLOUD_KEY_BASE64 (temp file)');
+      return tmp;
     } catch (e) {
-      console.warn('⚠️ No se pudo decodificar GOOGLE_CLOUD_KEY_BASE64:', e?.message || e);
+      LOG.warn('⚠️ No se pudo decodificar GOOGLE_CLOUD_KEY_BASE64:', e?.message || e);
     }
   }
+
+  if (keyJsonInline && keyJsonInline.startsWith('{')) {
+    try {
+      const tmp = path.join(os.tmpdir(), `gcp-key-${Date.now()}.json`);
+      fs.writeFileSync(tmp, keyJsonInline, { encoding: 'utf8', mode: 0o600 });
+      process.env.GOOGLE_APPLICATION_CREDENTIALS = tmp;
+      LOG.info('🔐 Google creds: usando GOOGLE_CLOUD_KEY_JSON (temp file)');
+      return tmp;
+    } catch (e) {
+      LOG.warn('⚠️ No se pudo escribir GOOGLE_CLOUD_KEY_JSON:', e?.message || e);
+    }
+  }
+
+  if (credPath) {
+    if (!path.isAbsolute(credPath)) credPath = path.join(process.cwd(), credPath);
+    if (fs.existsSync(credPath)) {
+      process.env.GOOGLE_APPLICATION_CREDENTIALS = credPath;
+      LOG.info('🔐 Google creds: usando archivo en %s', credPath);
+      return credPath;
+    } else {
+      LOG.warn('⚠️ GOOGLE_APPLICATION_CREDENTIALS apunta a un archivo inexistente: %s', credPath);
+    }
+  }
+
+  LOG.warn('⚠️ No se detectaron credenciales de Google. TTS fallará con UNAUTHENTICATED.');
+  return null;
 }
-const gTtsClient = new textToSpeech.TextToSpeechClient();
+setupGoogleCreds();
+
+// Cliente TTS
+const gTtsClient = new textToSpeech.TextToSpeechClient(
+  process.env.GOOGLE_APPLICATION_CREDENTIALS
+    ? { keyFilename: process.env.GOOGLE_APPLICATION_CREDENTIALS }
+    : {}
+);
 
 /* =========================
    n8n
@@ -78,10 +142,12 @@ const N8N_WEBHOOK_URL   = envStr('N8N_WEBHOOK_URL', ''); // opcional para logs
 
 async function callN8n(payloadObj) {
   if (!N8N_BASE_URL) {
-    console.warn('⚠️ N8N_BASE_URL vacío');
+    LOG.warn('⚠️ N8N_BASE_URL vacío');
     return null;
   }
   try {
+    LOG.debug('🌐 [n8n:req] POST %s body=%o', N8N_BASE_URL, payloadObj);
+    const t0 = Date.now();
     const res = await fetch(N8N_BASE_URL, {
       method: 'POST',
       headers: {
@@ -91,13 +157,16 @@ async function callN8n(payloadObj) {
       body: JSON.stringify(payloadObj),
     });
     const text = await res.text();
+    const dt = Date.now() - t0;
     if (!res.ok) {
-      console.error('❌ n8n error', res.status, text);
+      LOG.error('❌ [n8n:res] %s %dms status=%d body=%s', N8N_BASE_URL, dt, res.status, text?.slice(0, 400));
       return null;
     }
+    LOG.info('✅ [n8n:res] %s %dms status=%d', N8N_BASE_URL, dt, res.status);
+    if (LOG_N8N_BODIES) LOG.debug('📦 [n8n:body] %s', text?.slice(0, 2000));
     try { return JSON.parse(text); } catch { return text; }
   } catch (e) {
-    console.error('⚠️ callN8n exception:', e?.message || e);
+    LOG.error('⚠️ callN8n exception: %s', e?.message || e);
     return null;
   }
 }
@@ -124,6 +193,7 @@ const toNullIfEmpty = (v) => {
 
 async function fetchClientMemory(callerId) {
   const out = await callN8n({ action: 'get_memory', callerId });
+  LOG.debug('🧠 memoria n8n -> %o', out);
   if (!out || typeof out !== 'object') return {};
   const row = Array.isArray(out) ? out[0] : out;
   if (!row) return {};
@@ -135,10 +205,11 @@ async function fetchClientMemory(callerId) {
   };
 }
 
-/* ===== Helpers explícitos para menú y promos (desde BD vía n8n) ===== */
+/* ===== Helpers menú/promos ===== */
 async function fetchMenuOnly() {
   const out = await callN8n({ action: 'get_menu' });
   const menu = Array.isArray(out?.menu) ? out.menu : (Array.isArray(out) ? out : []);
+  LOG.info('🍕 menú recibido: %d items', menu.length);
   return menu.map(r => ({
     id: r.id,
     nombre: r.nombre,
@@ -151,6 +222,7 @@ async function fetchMenuOnly() {
 async function fetchPromosOnly() {
   const out = await callN8n({ action: 'get_promos' });
   const promos = Array.isArray(out?.promos) ? out.promos : (Array.isArray(out) ? out : []);
+  LOG.info('🎁 promos recibidas: %d items', promos.length);
   return promos.map(r => ({
     id: r.id,
     titulo: r.titulo,
@@ -181,11 +253,13 @@ function sanitizeSnapshot(x = {}) {
 
 async function pushClientMemoryUpdate(snapshot) {
   const s = sanitizeSnapshot(snapshot);
+  LOG.debug('📝 update_memory -> %o', s);
   await callN8n({ action: 'update_memory', ...s });
 }
 
 async function fetchBotConfig() {
   const out = await callN8n({ action: 'get_config' });
+  LOG.info('⚙️ config n8n recibida');
   if (!out || typeof out !== 'object') return { greeting: null, systemPrompt: null };
   return {
     greeting: out.greeting_es || null,
@@ -199,14 +273,15 @@ async function fetchBotConfig() {
 function renderTemplate(tpl, ctx = {}) {
   if (!tpl) return '';
   return tpl.replace(/\{\{([^}]+)\}\}/g, (_, expr) => {
-    const [path, defRaw] = expr.split('|').map(s => s?.trim());
+    const [pathStr, defRaw] = expr.split('|').map(s => s?.trim());
     const def = defRaw ?? '';
-    const v = path?.split('.').reduce((acc, k) =>
+    const v = pathStr?.split('.').reduce((acc, k) =>
       (acc && acc[k] !== undefined) ? acc[k] : undefined, ctx);
     return (v === undefined || v === null || v === '') ? def : String(v);
   });
 }
 
+// SLIM prompt: top N y campos mínimos para reducir tokens/latencia
 function buildSystemPromptFromDbTemplate(systemPromptTpl, session, hint = '') {
   const ctx = {
     callerId: session.callerId,
@@ -215,15 +290,24 @@ function buildSystemPromptFromDbTemplate(systemPromptTpl, session, hint = '') {
     direccionConfirmada: session.direccionConfirmada ? 'sí' : 'no',
   };
   let prompt = renderTemplate(systemPromptTpl, ctx);
-  const menuStr   = JSON.stringify(session.menu ?? []);
-  const promosStr = JSON.stringify(session.promos ?? []);
+
+  const menuSlim = (session.menu || [])
+    .filter(i => i?.disponible)
+    .slice(0, 8)
+    .map(({ nombre, precio }) => ({ nombre, precio }));
+
+  const promosSlim = (session.promos || [])
+    .filter(p => p?.activa)
+    .slice(0, 3)
+    .map(({ titulo, descripcion }) => ({ titulo, descripcion }));
+
   prompt += `
 
-Menú (JSON):
-${menuStr}
+Menú (máximo 8, nombre y precio):
+${JSON.stringify(menuSlim)}
 
-Promociones (JSON):
-${promosStr}
+Promociones (máximo 3):
+${JSON.stringify(promosSlim)}
 `.trim();
 
   if (hint) {
@@ -232,6 +316,7 @@ ${promosStr}
 Instrucción de turno:
 ${hint}`.trim();
   }
+  LOG.debug('📐 systemPrompt length=%d', prompt.length);
   return prompt;
 }
 
@@ -256,6 +341,11 @@ function classifyIntent(text) {
   return 'chat';
 }
 
+/* === Speech token === */
+function newSpeechToken() {
+  return `${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
+}
+
 /* =========================
    EXTRACCIÓN DE ENTIDADES
    ========================= */
@@ -264,7 +354,7 @@ async function extractEntities(userText) {
   const m1 = userText.match(/\b(me llamo|soy)\s+([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+)*)/i);
   if (m1) out.nombreCliente = m1[2].trim();
 
-  const pedidoRegex = /\b(quiero|deme|pon|me das|me pones|me agregas|una|un)\s+([a-záéíóúñ0-9\s\-\.,]{4,})/i;
+  const pedidoRegex = /\b(quiero|deme|pon|me das|me pones|me agregas|una|un)\s+([a-zÁÉÍÓÚÑáéíóúñ0-9\s\-\.,]{4,})/i;
   const m3 = userText.match(pedidoRegex);
   if (m3) out.ultimoPedido = m3[2].replace(/\s{2,}/g, ' ').trim();
 
@@ -279,61 +369,8 @@ async function extractEntities(userText) {
 
   out.nombreCliente = toNullIfEmpty(out.nombreCliente);
   out.ultimoPedido  = toNullIfEmpty(out.ultimoPedido);
+  LOG.debug('🔎 entidades extraídas: %o', out);
   return out;
-}
-
-/* =========================
-   OPENAI CHAT
-   ========================= */
-async function answerWithOpenAI_usingSystemPrompt(st, userText, systemPrompt) {
-  if (isNoiseUtterance(userText)) {
-    const canned = (st.session.step !== 'saludo')
-      ? 'Sí, te escucho claro. ¿Qué te gustaría pedir?'
-      : 'Pizza Nostra, hola. ¿Qué te gustaría pedir hoy?';
-    st.lastReplyText = canned;
-    return canned;
-  }
-
-  const apiKey = envStr('OPENAI_API_KEY', '');
-  if (!apiKey) {
-    const fallback = 'Claro, dime qué necesitas y te ayudo.';
-    st.lastReplyText = fallback;
-    return fallback;
-  }
-
-  const recentHistory = st.history.slice(-10);
-  const resp = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: 'gpt-4o-mini',
-      temperature: 0.45,
-      max_tokens: 120,
-      messages: [
-        { role: 'system', content: systemPrompt || 'Responde útil y breve en español.' },
-        ...recentHistory,
-        { role: 'user', content: userText },
-        st.lastReplyText
-          ? { role: 'system', content: `No repitas literalmente tu última respuesta: "${st.lastReplyText}". Di algo nuevo si es posible.` }
-          : null,
-      ].filter(Boolean),
-    }),
-  });
-
-  if (!resp.ok) {
-    const body = await resp.text().catch(()=> '');
-    console.error('❌ OpenAI Chat error', resp.status, body);
-    const fallback = 'Claro, dime qué necesitas y te ayudo.';
-    st.lastReplyText = fallback;
-    return fallback;
-  }
-  const data = await resp.json();
-  const reply = (data?.choices?.[0]?.message?.content || '').trim() || '¿En qué más te ayudo?';
-  st.lastReplyText = reply;
-  return reply;
 }
 
 /* =========================
@@ -363,7 +400,7 @@ function sendClear(ws, sid) {
   try { ws.send(JSON.stringify({ event: 'clear', streamSid: sid })); } catch {}
 }
 
-function createMulawSender(ws, sid, frameBytes = 160, frameMs = 20, prebufferBytes = 160*10) {
+function createMulawSender(ws, sid, frameBytes = 160, frameMs = 20, prebufferBytes = 160*20) {
   let buf = Buffer.alloc(0);
   let running = false;
   let nextTick = 0;
@@ -386,7 +423,7 @@ function createMulawSender(ws, sid, frameBytes = 160, frameMs = 20, prebufferByt
     try {
       ws.send(JSON.stringify({ event: 'media', streamSid: sid, media: { payload } }));
     } catch (e) {
-      console.error('❌ WS send error (paced):', e?.message || e);
+      LOG.error('❌ WS send error (paced): %s', e?.message || e);
       stop(); return;
     }
     if (nextTick === 0) nextTick = Date.now() + frameMs; else nextTick += frameMs;
@@ -408,20 +445,106 @@ function createMulawSender(ws, sid, frameBytes = 160, frameMs = 20, prebufferByt
 /* =========================
    GOOGLE CLOUD TTS
    ========================= */
-
-// Construye SSML simple con pausas cortas entre oraciones (opcional)
 function buildGoogleSSMLFromText(text) {
-  const pauseMs = envNum('GOOGLE_TTS_PAUSE_MS', 220);
+  const pauseMs = GOOGLE_TTS_PAUSE_MS;
   const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   const sentences = esc(text).split(/(?<=[\.\!\?…:;])\s+/).map(s=>s.trim()).filter(Boolean);
   const body = sentences.map((s,i)=> `${s}${i<sentences.length-1 ? ` <break time="${pauseMs}ms"/>` : ''}`).join(' ');
   return `<speak>${body}</speak>`;
 }
 
+async function synthesizeGoogle(text) {
+  const input = { ssml: buildGoogleSSMLFromText(text) };
+  const request = {
+    input,
+    voice: { languageCode: GOOGLE_TTS_LANGUAGE, name: GOOGLE_TTS_VOICE },
+    audioConfig: {
+      audioEncoding: 'MULAW',
+      sampleRateHertz: 8000,
+      speakingRate: Number(GOOGLE_TTS_RATE),
+      pitch: Number(GOOGLE_TTS_PITCH),
+      effectsProfileId: GOOGLE_TTS_EFFECTS ? [GOOGLE_TTS_EFFECTS] : []
+    },
+  };
+  const t0 = Date.now();
+  const [resp] = await gTtsClient.synthesizeSpeech(request);
+  const dt = Date.now() - t0;
+  const audio = resp?.audioContent ? Buffer.from(resp.audioContent, 'base64') : null;
+  LOG.info('🔊 TTS synth len=%s bytes tiempo=%dms', audio?.length ?? 0, dt);
+  return audio ?? null;
+}
+
+function pushAudioToCaller(st, ws, streamSid, audioBuf) {
+  if (!audioBuf || audioBuf.length === 0) return;
+  if (!st.ttsSender) st.ttsSender = createMulawSender(ws, streamSid, 160, 20, 160*20);
+  if (!st._ttsClearedThisTurn) {
+    sendClear(ws, streamSid);
+    st._ttsClearedThisTurn = true;
+    LOG.debug('🧽 clear audio buffer (inicio de turno) %s', streamSid);
+  }
+  const CHUNK = 160;
+  LOG.debug('📤 enviando audio a Twilio: %d bytes (~%d ms)', audioBuf.length, Math.round(audioBuf.length / 160 * 20));
+  for (let i = 0; i < audioBuf.length; i += CHUNK) {
+    const slice = audioBuf.subarray(i, Math.min(i + CHUNK, audioBuf.length));
+    st.ttsSender?.push(slice);
+  }
+  const tail = Buffer.alloc(160 * 8, 0xff);
+  st.ttsSender?.push(tail);
+}
+
+function resetTtsQueue(st) {
+  st._ttsQueue = [];
+  st._ttsBusy = false;
+  st._ttsClearedThisTurn = false;
+  LOG.debug('🧺 TTS queue reset');
+}
+
+/* =========================
+   SINGLE-SHOT TTS QUEUE (descarta audio viejo por token)
+   ========================= */
+async function processTtsQueue(st, ws, streamSid) {
+  if (st._ttsBusy) return;
+  const item = st._ttsQueue?.shift();
+  if (!item) return;
+
+  st._ttsBusy = true;
+  LOG.debug('⏳ TTS dequeued (%d chars) token=%s', item.text.length, item.token);
+  try {
+    const audio = await synthesizeGoogle(item.text);
+    if (!audio) return;
+    if (item.token !== st.speechToken) {
+      LOG.debug('🪓 audio descartado por token viejo (%s != %s)', item.token, st.speechToken);
+      return;
+    }
+    pushAudioToCaller(st, ws, streamSid, audio);
+  } catch (e) {
+    LOG.error('❌ TTS cola (sintetizar) error: %s', e?.message || e);
+  } finally {
+    st._ttsBusy = false;
+    if (st._ttsQueue && st._ttsQueue.length > 0) processTtsQueue(st, ws, streamSid);
+  }
+}
+
+function enqueueTts(st, ws, streamSid, text) {
+  if (!text || !text.trim()) return;
+  const t = text.trim().replace(/\s+/g,' ');
+  if (!st._ttsQueue) st._ttsQueue = [];
+
+  const token = st.speechToken;
+  st._ttsQueue.push({ text: t, token });
+  LOG.debug('➕ enqueue TTS (%d chars) queue=%d token=%s', t.length, st._ttsQueue.length, token);
+
+  processTtsQueue(st, ws, streamSid);
+}
+
 function stopTTS(ws, streamSid, reason='stop') {
   const callSid = streamToCall.get(streamSid);
   const st = callSid ? statesByCall.get(callSid) : null;
   if (!st) return;
+
+  // invalida TODO audio pendiente
+  st.speechToken = newSpeechToken();
+
   if (reason === 'barge') {
     logToN8n({ streamSid, type: 'assistant_interrupted', reason: 'caller_barged_in', ts: new Date().toISOString() });
   }
@@ -429,70 +552,151 @@ function stopTTS(ws, streamSid, reason='stop') {
   st.bargeStreak = 0;
   st.lastTtsStopTime = Date.now();
   if (st.ttsSender) try { st.ttsSender.stop(); } catch {}
-  sendClear(ws, streamSid);
-  console.log('🤫 TTS detenido (' + reason + ')', streamSid);
+  resetTtsQueue(st);
+  LOG.info('🤫 TTS detenido (%s) %s', reason, streamSid);
 }
 
 async function speakWithGoogleTTS(ws, streamSid, text) {
   try {
-    // Prepara estado
     const callSid = streamToCall.get(streamSid);
     const st = callSid ? statesByCall.get(callSid) : null;
     if (!st) return;
 
-    console.log('🗣️ Asistente (Google TTS):', text);
+    LOG.info('🗣️ Asistente (Google TTS): "%s"', text);
 
-    // Construimos SSML o TEXT (prefiero SSML para pausas)
-    const useSSML = true;
-    const input = useSSML ? { ssml: buildGoogleSSMLFromText(text) } : { text };
+    const myToken = st.speechToken;
+    const audio = await synthesizeGoogle(text);
+    if (!audio) { LOG.warn('⚠️ Google TTS devolvió audio vacío'); return; }
 
-    const request = {
-      input,
-      voice: {
-        languageCode: GOOGLE_TTS_LANGUAGE,
-        name: GOOGLE_TTS_VOICE, // p.ej. "es-US-Chirp3-HD-Zephyr"
-        // ssmlGender no es necesario si se usa name
-      },
-      audioConfig: {
-        audioEncoding: 'MULAW',
-        sampleRateHertz: 8000,
-        speakingRate: Number(GOOGLE_TTS_RATE),
-        pitch: Number(GOOGLE_TTS_PITCH),
-        effectsProfileId: GOOGLE_TTS_EFFECTS ? [GOOGLE_TTS_EFFECTS] : []
-      },
-    };
-
-    const [resp] = await gTtsClient.synthesizeSpeech(request);
-    const audio = resp?.audioContent ? Buffer.from(resp.audioContent, 'base64') : null;
-    if (!audio || audio.length === 0) {
-      console.warn('⚠️ Google TTS devolvió audio vacío'); return;
+    if (myToken !== st.speechToken) {
+      LOG.debug('🪓 speak: audio descartado por token viejo');
+      return;
     }
 
-    if (!st.ttsSender) st.ttsSender = createMulawSender(ws, streamSid, 160, 20, 160*10);
-    sendClear(ws, streamSid);
-
-    const CHUNK = 160;
-    for (let i = 0; i < audio.length; i += CHUNK) {
-      const slice = audio.subarray(i, Math.min(i + CHUNK, audio.length));
-      st.ttsSender?.push(slice);
+    if (!st.ttsSender) st.ttsSender = createMulawSender(ws, streamSid, 160, 20, 160*20);
+    if (!st._ttsClearedThisTurn) {
+      sendClear(ws, streamSid);
+      st._ttsClearedThisTurn = true;
+      LOG.debug('🧽 clear audio buffer (saludo)');
     }
-    // pequeña cola de silencio (~120ms)
-    const tail = Buffer.alloc(160 * 6, 0xff);
-    st.ttsSender?.push(tail);
+    pushAudioToCaller(st, ws, streamSid, audio);
 
     st.lastAssistantReplySent = text;
     st.ttsActive = true;
   } catch (err) {
-    console.error('❌ speakWithGoogleTTS exception', err?.message || err);
+    LOG.error('❌ speakWithGoogleTTS exception %s', err?.message || err);
   }
+}
+
+/* =========================
+   OPENAI CHAT — Streaming por frases -> TTS
+   ========================= */
+async function streamAndSpeakOpenAI(st, ws, streamSid, userText, systemPrompt) {
+  if (isNoiseUtterance(userText)) {
+    return (st.session.step !== 'saludo') ? 'Te escucho…' : 'Hola…';
+  }
+
+  const apiKey = envStr('OPENAI_API_KEY', '');
+  if (!apiKey) return 'Dime y te ayudo.';
+
+  LOG.info('🤖 OpenAI streaming por frases: prompt_len=%d user_len=%d', (systemPrompt||'').length, userText.length);
+
+  const recentHistory = st.history.slice(-10);
+  const res = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'gpt-4o-mini',
+      temperature: 0.45,
+      stream: true,
+      // Limita longitud para bajar latencia. Ajusta 160–220 si quieres más/menos.
+      max_tokens: 200,
+      messages: [
+        { role: 'system', content: systemPrompt || 'Responde útil y breve en español.' },
+        ...recentHistory,
+        { role: 'user', content: userText },
+        st.lastReplyText
+          ? { role: 'system', content: `No repitas literalmente tu última respuesta: "${st.lastReplyText}". Sé conciso y avanza el flujo.` }
+          : null,
+      ].filter(Boolean),
+    }),
+  });
+
+  if (!res.ok || !res.body) {
+    const body = await res.text().catch(()=> '');
+    LOG.error('❌ OpenAI stream error %d: %s', res.status, body?.slice(0, 400));
+    return 'Entendido. ¿Qué necesitas?';
+  }
+
+  // Preparar turno: invalidar audio anterior y limpiar cola
+  stopTTS(ws, streamSid, 'before_new_reply');
+  st.speechToken = newSpeechToken();
+  resetTtsQueue(st);
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder('utf-8');
+  let done = false;
+  let accText = '';
+  let buffer = '';
+  let sseBytes = 0, ssePackets = 0;
+
+  const flushChunk = (hard=false) => {
+    const chunk = buffer.trim();
+    if (!chunk) return;
+    if (!hard && chunk.length < 10) return; // evita micro-trozos
+    enqueueTts(st, ws, streamSid, chunk);
+    LOG.debug('🟢 speak-chunk (%d chars): "%s"', chunk.length, chunk.slice(0, 80));
+    buffer = '';
+  };
+
+  while (!done) {
+    const { value, done: doneNow } = await reader.read();
+    done = doneNow;
+    if (value) {
+      sseBytes += value.byteLength;
+      const chunk = decoder.decode(value, { stream: true });
+      if (LOG_SSE_CHUNKS) LOG.debug('📡 SSE chunk bytes=%d', value.byteLength);
+      const lines = chunk.split('\n');
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('data:')) continue;
+        const dataStr = trimmed.replace(/^data:\s*/, '');
+        ssePackets++;
+        if (dataStr === '[DONE]') { done = true; break; }
+        try {
+          const json = JSON.parse(dataStr);
+          const delta = json?.choices?.[0]?.delta?.content || '';
+          if (!delta) continue;
+          accText += delta;
+          buffer += delta;
+
+          // si cerró una frase o el buffer creció, hablar ya
+          if (/[.?!…:;]\s$/.test(buffer) || buffer.length >= 160) {
+            flushChunk(false);
+          }
+        } catch {}
+      }
+    }
+  }
+
+  // Último resto
+  flushChunk(true);
+
+  LOG.info('✅ OpenAI stream fin | bytes=%d | pkts=%d | reply_len=%d', sseBytes, ssePackets, accText.trim().length);
+
+  st.ttsActive = true;
+  return accText.trim() || '¿En qué más te ayudo?';
 }
 
 /* =========================
    ESTADO POR LLAMADA
    ========================= */
-const statesByCall = new Map(); // callSid -> estado
-const streamToCall = new Map(); // streamSid -> callSid
-const streams      = new Map(); // streamSid -> socket Twilio
+const statesByCall = new Map();
+const streamToCall = new Map();
+const streams      = new Map();
 let activePrimarySid = null;
 
 function ensureCallState(callSid) {
@@ -528,6 +732,15 @@ function ensureCallState(callSid) {
       dgSocket: null,
       stopHeartbeat: null,
       _config: null,
+      _ttsQueue: [],
+      _ttsBusy: false,
+      _ttsClearedThisTurn: false,
+
+      // control duro de cancelación
+      speechToken: newSpeechToken(),
+
+      // flag VAD para pausar/stop
+      callerTalking: false,
     });
   }
   return statesByCall.get(callSid);
@@ -585,6 +798,7 @@ async function persistSnapshotFromText(st, assistantReplyText) {
   st.session.ultimoPedido         = snapshot.ultimoPedido;
   st.session.direccionConfirmada  = snapshot.direccionConfirmada;
 
+  LOG.debug('💾 persist snapshot %o', snapshot);
   await pushClientMemoryUpdate(snapshot);
 }
 
@@ -592,7 +806,7 @@ async function handleCompleteUserTurn(twilioSocket, streamSid, st) {
   if (st.handlingTurn) return;
   st.handlingTurn = true;
   try {
-    const COOLDOWN_MS = 250;
+    const COOLDOWN_MS = 200;
     if (st.ttsActive) return;
     if (st.lastTtsStopTime && Date.now() - st.lastTtsStopTime < COOLDOWN_MS) return;
 
@@ -603,18 +817,19 @@ async function handleCompleteUserTurn(twilioSocket, streamSid, st) {
     st.history.push({ role: 'user', content: humanText });
     if (st.history.length > 30) st.history.splice(0, st.history.length - 30);
 
+    LOG.info('👤 Turno usuario (final): "%s"', humanText);
     logToN8n({ streamSid, type: 'user_turn_finalized', role: 'user', mensaje: humanText, ts: new Date().toISOString() });
 
     const intent = classifyIntent(humanText);
+    LOG.debug('🧭 intent=%s', intent);
 
-    // Solo hint → LLM decide; sin textos estáticos
     let hint = '';
     if (intent === 'ask_menu') {
       st.session.menu = await fetchMenuOnly();
-      hint = 'El usuario pidió MENÚ: usa 3–5 opciones con nombre y precio desde el JSON Menú. No inventes.';
+      hint = 'El usuario pidió MENÚ: usa 3–5 opciones con nombre y precio desde el JSON Menú (no inventes). Sé breve.';
     } else if (intent === 'ask_promos') {
       st.session.promos = await fetchPromosOnly();
-      hint = 'El usuario pidió PROMOCIONES: usa 1–2 activas del JSON Promociones. No inventes.';
+      hint = 'El usuario pidió PROMOCIONES: usa 1–2 activas del JSON Promociones (no inventes). Sé breve.';
     } else if (intent === 'confirm_address') {
       st.session.direccionConfirmada = true;
       hint = 'El usuario confirmó dirección: continúa el flujo de cierre según reglas.';
@@ -625,20 +840,21 @@ async function handleCompleteUserTurn(twilioSocket, streamSid, st) {
     if (!st._config) st._config = await fetchBotConfig();
     const sysPrompt = buildSystemPromptFromDbTemplate(st._config?.systemPrompt || '', st.session, hint);
 
-    const reply = await answerWithOpenAI_usingSystemPrompt(st, humanText, sysPrompt);
+    // === Obtener y HABLAR mientras llega (frases)
+    const finalText = await streamAndSpeakOpenAI(st, twilioSocket, streamSid, humanText, sysPrompt);
 
-    // Enviar TTS con Google
-    stopTTS(twilioSocket, streamSid, 'before_new_reply');
-    await speakWithGoogleTTS(twilioSocket, streamSid, reply);
+    LOG.info('🤖 Respuesta final LLM (%d chars)', finalText.length);
 
-    st.history.push({ role: 'assistant', content: reply });
+    // Guarda historial
+    st.history.push({ role: 'assistant', content: finalText });
     if (st.history.length > 30) st.history.splice(0, st.history.length - 30);
     st.lastUserTurnHandled      = humanText;
     st.lastUserTurnAnsweredText = humanText;
     st.partialBuffer            = '';
-    st.lastReplyText            = reply;
+    st.lastReplyText            = finalText;
 
-    await persistSnapshotFromText(st, reply);
+    await persistSnapshotFromText(st, finalText);
+    st.ttsActive = true;
 
   } finally {
     st.handlingTurn = false;
@@ -646,7 +862,7 @@ async function handleCompleteUserTurn(twilioSocket, streamSid, st) {
 }
 
 /* =========================
-   Twilio customParameters (robusto)
+   Twilio customParameters
    ========================= */
 function readStartParam(msg, key) {
   const raw = msg?.start?.customParameters;
@@ -671,23 +887,26 @@ function readStartParam(msg, key) {
    WEBSOCKET / Twilio
    ========================= */
 const wss = new WebSocketServer({ noServer: true });
-const RMS_BARGE_THRESHOLD = 0.05;
-const BARGE_STREAK_FRAMES = 3;
+// Umbrales de barge-in (ajustables por ENV)
+const RMS_BARGE_THRESHOLD = Number(envStr('RMS_BARGE_THRESHOLD', '0.03'));
+const BARGE_STREAK_FRAMES = Number(envStr('BARGE_STREAK_FRAMES', '2'));
 
 wss.on('connection', async (twilioSocket, req) => {
-  console.log('📞 Conexión de Twilio desde', req?.socket?.remoteAddress, 'url:', req?.url);
+  LOG.info('📞 Conexión de Twilio desde %s url: %s', req?.socket?.remoteAddress, req?.url);
   twilioSocket.on('ping', () => { try { twilioSocket.pong(); } catch {} });
-  twilioSocket.on('error', e => console.error('❌ WS client error:', e?.message || e));
+  twilioSocket.on('error', e => LOG.error('❌ WS client error: %s', e?.message || e));
+
+  let mediaFrames = 0;
+  let mediaLastTs = Date.now();
 
   twilioSocket.on('message', async (raw) => {
     const str = Buffer.isBuffer(raw) ? raw.toString('utf8') : String(raw);
     let msg; try { msg = JSON.parse(str); } catch { return; }
 
-    /* ===== START ===== */
     if (msg.event === 'start') {
       const streamSid = normalizeSid(msg?.start?.streamSid);
       const callSid   = msg?.start?.callSid || streamSid || 'desconocido';
-      if (!streamSid) { console.warn('⚠️ start sin streamSid'); return; }
+      if (!streamSid) { LOG.warn('⚠️ start sin streamSid'); return; }
 
       activePrimarySid = streamSid;
       twilioSocket.streamSid = streamSid;
@@ -695,7 +914,7 @@ wss.on('connection', async (twilioSocket, req) => {
       streamToCall.set(streamSid, callSid);
 
       const st = ensureCallState(callSid);
-      console.log('▶️ start streamSid:', streamSid, 'callSid:', callSid, '| streams activos:', streams.size);
+      LOG.info('▶️ start streamSid=%s callSid=%s | activos=%d', streamSid, callSid, streams.size);
 
       const fromParam = readStartParam(msg, 'from');
       const toParam   = readStartParam(msg, 'to');
@@ -712,19 +931,20 @@ wss.on('connection', async (twilioSocket, req) => {
       if (!st.dgSocket) {
         const dgSocket = await deepgram.listen.live({
           model: 'nova-3',
-          language: 'es',
+          language:'es-419',
           punctuate: true,
           encoding: 'mulaw',
           sample_rate: 8000,
           interim_results: true,
           vad_events: true,
-          endpointing: envStr('DG_ENDPOINTING', '200'),
+          // ↓ default más bajo para cerrar turnos rápido (ajustable por ENV)
+          endpointing: envStr('DG_ENDPOINTING', '300'),
           smart_format: false,
         });
         st.dgSocket = dgSocket;
 
         dgSocket.on(LiveTranscriptionEvents.Open, async () => {
-          console.log('🎤 DG abierto callSid:', callSid, 'streamSid:', streamSid);
+          LOG.info('🎤 DG OPEN callSid=%s streamSid=%s', callSid, streamSid);
           st.stopHeartbeat = startDeepgramHeartbeat(dgSocket);
 
           if (!st._config) {
@@ -744,12 +964,12 @@ wss.on('connection', async (twilioSocket, req) => {
               }
               st.session.menu   = data?.menu   || [];
               st.session.promos = data?.promos || [];
-            } catch (e) { console.error('precarga error:', e?.message || e); }
+              LOG.debug('🔄 precarga menú/promos y memoria OK');
+            } catch (e) { LOG.error('precarga error: %s', e?.message || e); }
           }
 
-          // Saludo inicial desde BD (Google TTS)
           if (!st.hasGreeted) {
-            const greetingTpl = st._config?.greeting || '¡Hola! Hablas con Martina de Pizza Nostra. ¿Qué te gustaría pedir hoy?';
+            const greetingTpl = st._config?.greeting || '¡Hola! ¿Qué te gustaría pedir hoy?';
             const saludo = renderTemplate(greetingTpl, {
               callerId: st.session.callerId,
               nombreCliente: st.session.nombreCliente,
@@ -768,6 +988,7 @@ wss.on('connection', async (twilioSocket, req) => {
             st.hasGreeted = true;
 
             stopTTS(twilioSocket, streamSid, 'before_greeting');
+            resetTtsQueue(st);
             await speakWithGoogleTTS(twilioSocket, streamSid, saludo);
           }
         });
@@ -782,7 +1003,11 @@ wss.on('connection', async (twilioSocket, req) => {
           const normalized = rawTxt.replace(/\s+/g, ' ').trim();
           st.partialBuffer = normalized;
 
-          console.log(isFinal ? '🗣️ Cliente (final):' : '🗣️ Cliente (parcial):', normalized);
+          if (isFinal) {
+            LOG.info('🗣️ Cliente (final): %s', normalized);
+          } else {
+            LOG.debug('🗣️ Cliente (parcial): %s', normalized);
+          }
           logToN8n({ streamSid, type: isFinal ? 'user_final_raw' : 'user_partial', role: 'user', mensaje: normalized, ts: new Date().toISOString() });
 
           if (isFinal) {
@@ -791,15 +1016,14 @@ wss.on('connection', async (twilioSocket, req) => {
           }
         });
 
-        dgSocket.on(LiveTranscriptionEvents.Error, (err) => console.error('❌ Deepgram:', err));
-        dgSocket.on(LiveTranscriptionEvents.Close, () => console.log('📴 Deepgram Close (espera hangup) callSid:', callSid));
+        dgSocket.on(LiveTranscriptionEvents.Error, (err) => LOG.error('❌ Deepgram:', err));
+        dgSocket.on(LiveTranscriptionEvents.Close, () => LOG.warn('📴 Deepgram CLOSE (espera hangup) callSid=%s', callSid));
       } else {
-        console.log('🔁 Reusando DG/estado para callSid', callSid, 'nuevo streamSid', streamSid);
+        LOG.info('🔁 Reusando DG/estado callSid=%s nuevo streamSid=%s', callSid, streamSid);
       }
       return;
     }
 
-    /* ===== MEDIA ===== */
     if (msg.event === 'media') {
       const streamSid = twilioSocket.streamSid;
       if (!streamSid || streamSid !== activePrimarySid) return;
@@ -814,9 +1038,21 @@ wss.on('connection', async (twilioSocket, req) => {
       const audioUlaw = Buffer.from(payload, 'base64');
       if (audioUlaw.length === 0) return;
 
-      // Barge-in
+      if (LOG_MEDIA) {
+        mediaFrames++;
+        const now = Date.now();
+        if (now - mediaLastTs >= 1000) {
+          LOG.debug('🎛️ media frames last 1s: %d', mediaFrames);
+          mediaFrames = 0;
+          mediaLastTs = now;
+        }
+      }
+
+      // VAD + barge-in
       const vadInfoOpenLike = processFrame(streamSid, audioUlaw);
       const callerTalking   = !!vadInfoOpenLike.open;
+      st.callerTalking = callerTalking;
+
       if (st.ttsActive) {
         if (callerTalking) {
           st.bargeStreak = (st.bargeStreak || 0) + 1;
@@ -826,6 +1062,7 @@ wss.on('connection', async (twilioSocket, req) => {
           else st.bargeStreak = 0;
         }
         if (st.bargeStreak >= BARGE_STREAK_FRAMES) {
+          LOG.info('✋ barge-in detectado');
           stopTTS(twilioSocket, streamSid, 'barge');
           st.bargeStreak = 0;
         }
@@ -833,20 +1070,18 @@ wss.on('connection', async (twilioSocket, req) => {
         st.bargeStreak = 0;
       }
 
-      // enviar audio a Deepgram
       if (st.dgSocket) {
         try { st.dgSocket.send(audioUlaw); } catch (e) {
-          console.error('❌ DG send error', e?.message || e);
+          LOG.error('❌ DG send error %s', e?.message || e);
         }
       }
       return;
     }
 
-    /* ===== STOP ===== */
     if (msg.event === 'stop') {
       const streamSid = twilioSocket.streamSid;
       const callSid   = streamToCall.get(streamSid);
-      console.log('⏹️ Twilio stop', streamSid, 'callSid', callSid);
+      LOG.warn('⏹️ Twilio stop %s callSid=%s', streamSid, callSid);
 
       streams.delete(streamSid);
       streamToCall.delete(streamSid);
@@ -879,7 +1114,7 @@ wss.on('connection', async (twilioSocket, req) => {
   twilioSocket.on('close', async () => {
     const streamSid = twilioSocket.streamSid;
     const callSid   = streamToCall.get(streamSid);
-    console.log('❌ Twilio cerró la conexión', streamSid, 'callSid', callSid);
+    LOG.warn('❌ Twilio cerró la conexión %s callSid=%s', streamSid, callSid);
 
     streams.delete(streamSid);
     streamToCall.delete(streamSid);
@@ -919,13 +1154,13 @@ setInterval(() => {
   for (const ws of wss.clients) { try { ws.ping(); } catch {} }
 }, PING_EVERY_MS);
 
-wss.on('error', (err) => console.error('❌ WSS error:', err));
+wss.on('error', (err) => LOG.error('❌ WSS error: %s', err));
 
 /* =========================
    HTTP + UPGRADE A WS
    ========================= */
 app.server = app.listen(port, () => {
-  console.log(`🚀 Servidor escuchando en http://localhost:${port}`);
+  LOG.info(`🚀 Servidor escuchando en http://localhost:${port}`);
 });
 app.server.on('upgrade', (req, socket, head) => {
   if (!req.url || !req.url.startsWith('/twilio')) { socket.destroy(); return; }
